@@ -5,7 +5,7 @@
    | |\  |  __/ |_| | | | (_) | |__| (_) | (_| |
    |_| \_|\___|\__,_|_|  \___/|_____\___/ \__, |
                                            |___/
-   Neuro-Symbolic Vulnerability Analysis via Datalog
+   Neuro-Symbolic Static Analysis via Datalog
 
    Neuro  =  LLM perceives code, extracts semantic facts
    Log    =  Datalog reasons formally over those facts
@@ -13,15 +13,19 @@
 
 # NeuroLog
 
-**Compilation-free vulnerability detection for C/C++ using neuro-symbolic analysis: LLM perception + Datalog reasoning.**
+**Compilation-free static analysis for C/C++ using neuro-symbolic reasoning: LLM perception + Datalog logic.**
 
-NeuroLog is a neuro-symbolic static analysis pipeline that detects memory corruption vulnerabilities in C/C++ source code without requiring compilation. The **neural** component (an LLM) reads raw source code and extracts structured Datalog facts; the **symbolic** component (Souffle Datalog) performs formal interprocedural taint analysis, memory safety reasoning, and integer overflow detection.
+NeuroLog is a neuro-symbolic static analysis research prototype that extracts and reasons about program properties from C/C++ source code — without requiring compilation. The **neural** component (an LLM) reads raw source code and extracts structured Datalog facts representing data flow, control flow, type information, and function relationships; the **symbolic** component (Souffle Datalog) performs formal interprocedural reasoning over those facts.
+
+The extracted fact base is general-purpose: the same facts support taint analysis, memory safety checks, type safety reasoning, crypto API misuse detection, and any other property expressible in Datalog. Users can write custom Datalog rules to query arbitrary program properties.
 
 ## Key Idea
 
 Traditional static analysis tools require a complete build environment to produce an intermediate representation (AST, CFG, SSA). This is a significant barrier for analyzing legacy code, partial codebases, or projects with complex build systems.
 
-**NeuroLog replaces the compiler frontend with an LLM.** The LLM reads C source directly and emits the same structured facts (Def, Use, Call, Guard, MemWrite, etc.) that a compiler-based extractor would produce. These facts feed into standard Datalog rules that perform interprocedural taint analysis — no compilation, no headers, no build system required.
+**NeuroLog replaces the compiler frontend with an LLM.** The LLM reads C source directly and emits the same structured facts (Def, Use, Call, Guard, MemWrite, etc.) that a compiler-based extractor would produce. These facts feed into standard Datalog rules for interprocedural analysis — no compilation, no headers, no build system required.
+
+Because the reasoning layer is Datalog, the analysis is **extensible by writing rules, not code**. Adding a new analysis (e.g., detecting insecure crypto API usage, checking resource leak patterns, or enforcing coding standards) requires only new `.dl` rule files — the fact extraction is reused as-is.
 
 ```
                           NEURAL                          SYMBOLIC
@@ -34,12 +38,29 @@ Traditional static analysis tools require a complete build environment to produc
    targeted funcs ─►│  LLM (Claude)   │──── Datalog facts (Def, Use, Call, Guard,
                     │  (perception)   │     MemWrite, Cast, ArithOp, VarType, ...)
                     └────────┬────────┘
-                             │              ┌─────────────────────────────────────┐
-                    ┌────────▼────────┐     │  Interprocedural taint analysis     │
-   .facts files ───►│  Souffle        │────►│  Memory safety (BOIL, alloc size)   │
-                    │  (reasoning)    │     │  Type safety (signedness, truncation)│
-                    └─────────────────┘     └─────────────────────────────────────┘
+                             │              ┌──────────────────────────────────────┐
+                    ┌────────▼────────┐     │  Data/control flow properties        │
+   .facts files ───►│  Souffle        │────►│  Security (taint, memory, type)      │
+                    │  (reasoning)    │     │  Custom queries (crypto, resources)  │
+                    └─────────────────┘     └──────────────────────────────────────┘
 ```
+
+## What Can You Analyze?
+
+NeuroLog's fact base captures definitions, uses, calls, control flow edges, guards, memory operations, types, and casts for every function. This enables a range of analyses:
+
+| Analysis Domain | Example Queries | Status |
+|----------------|-----------------|--------|
+| **Interprocedural taint** | Does user input reach `strcpy`? Does a network buffer flow to `system()`? | Implemented |
+| **Memory safety** | Buffer overflow in loops, use-after-free, double-free, tainted allocation sizes | Implemented |
+| **Type safety** | Signed/unsigned mismatches on tainted data, truncation casts, width mismatches | Implemented |
+| **Crypto API misuse** | Does a hardcoded key reach `EVP_EncryptInit`? Is `ECB` mode used with AES? Is `rand()` used for key generation? | Planned |
+| **Resource leaks** | Is a file descriptor opened but never closed on some path? | Planned |
+| **Custom properties** | Any interprocedural data/control flow property expressible in Datalog | Write your own `.dl` rules |
+
+### Note on LLM Model
+
+All evaluation results were obtained using **Claude Sonnet 4.6** (`anthropic/claude-sonnet-4-6`). The quality of extracted facts — and therefore the accuracy of downstream analyses — depends on the LLM's ability to understand C code semantics. Results may vary with different models or model versions. The pipeline is model-agnostic via LiteLLM and can be configured to use any supported LLM (see `.env`), but we recommend using a frontier-class model for best results.
 
 ## Evaluation Results
 
@@ -179,20 +200,57 @@ This covers:
 - Interprocedural taint propagation mechanics
 - Defensive rules that compensate for LLM imprecision
 
-## Vulnerability Classes Detected
+## Built-in Analyses
 
-| Class | Datalog Relation | Description |
-|-------|-----------------|-------------|
-| Tainted sink | `TaintedSink` | Attacker-controlled data reaches a dangerous function (strcpy, malloc, free, etc.) |
+### Security Properties (Implemented)
+
+| Property | Datalog Relation | Description |
+|----------|-----------------|-------------|
+| Tainted sink | `TaintedSink` | Untrusted data reaches a dangerous function (strcpy, malloc, free, etc.) |
 | Unguarded tainted sink | `UnguardedTaintedSink` | Tainted sink with no bounds check or NULL guard |
 | Use-after-free | `UseAfterFree` | Pointer used after being passed to free/deallocate |
 | Double-free | `DoubleFree` | Same pointer freed twice without reassignment |
 | Buffer overflow in loop | `BufferOverflowInLoop` | Tainted loop bound with buffer write in body |
 | Tainted allocation size | `TaintedSizeAtSink` | Tainted value used as allocation/copy size |
-| Signedness mismatch | `TaintedSignednessMismatch` | Signed↔unsigned conversion on tainted data |
+| Signedness mismatch | `TaintedSignednessMismatch` | Signed/unsigned conversion on tainted data |
 | Truncation cast | `TruncationCast` | Narrowing cast that loses bits |
 | Type safety finding | `TypeSafetyFinding` | Combined type confusion findings |
 | Memory safety finding | `MemSafetyFinding` | Combined memory safety findings |
+
+### Data/Control Flow Properties (Reusable Foundation)
+
+| Relation | Description |
+|----------|-------------|
+| `TaintedVar` | Interprocedural taint propagation — tracks which variables carry untrusted data |
+| `DefReachesUse` | Reaching definitions — which definition of a variable is live at a given use |
+| `CFGReach` | Control flow reachability between program points |
+| `PointsTo` | Pointer alias analysis |
+| `TaintSummary` | Per-function taint transfer summaries (parameter → return/output) |
+
+These relations are computed by the pipeline and available for custom downstream queries.
+
+### Writing Custom Analyses
+
+To add a new analysis, create a `.dl` file in `rules/` that reads from the fact base. For example, to detect hardcoded keys passed to crypto functions:
+
+```prolog
+// crypto_misuse.dl — detect hardcoded keys reaching encryption APIs
+.decl DangerousCryptoSink(func: symbol, arg: number, risk: symbol)
+.input DangerousCryptoSink
+
+.decl HardcodedKeyAtCrypto(caller: symbol, callee: symbol, line: number, var: symbol)
+.output HardcodedKeyAtCrypto
+
+// Flag calls where a string literal or constant reaches a crypto key parameter
+HardcodedKeyAtCrypto(f, callee, ca, var) :-
+    Call(f, callee, ca),
+    DangerousCryptoSink(callee, idx, _),
+    ActualArg(ca, idx, _, var, _),
+    Def(f, var, da, "const"),
+    DefReachesUse(f, var, da, ca).
+```
+
+Then run: `python souffle_runner.py crypto_misuse.dl facts/ output/`
 
 ## Comparison with Related Tools
 
@@ -205,7 +263,7 @@ This covers:
 | [Semgrep](https://semgrep.dev/) | Pattern matching on AST | No | 30+ languages | Limited | Free/Paid |
 | [Infer](https://fbinfer.com/) | Abstract interpretation (bi-abduction) | Yes | C/C++, Java, ObjC | Yes | Free (OSS) |
 
-**Key differentiator**: NeuroLog is the only tool that combines compilation-free analysis with formal Datalog-based interprocedural reasoning. CodeQL and DOOP require compilation; Joern and Semgrep don't use formal Datalog. The LLM serves as a "semantic compiler" that understands C without needing headers, build systems, or platform-specific toolchains.
+**Key differentiator**: NeuroLog combines compilation-free analysis with formal Datalog-based interprocedural reasoning. CodeQL and DOOP require compilation; Joern and Semgrep don't use formal Datalog. The LLM serves as a "semantic compiler" that understands C without needing headers, build systems, or platform-specific toolchains. Because the reasoning layer is standard Datalog, users can write custom queries for any property — security, correctness, coding standards — without modifying the extraction pipeline.
 
 ## TODO / Known Limitations
 
