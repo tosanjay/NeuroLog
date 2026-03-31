@@ -70,7 +70,7 @@ Compared against **Joern** (a traditional CPG-based analysis tool) on 5 vulnerab
 
 | Metric | NeuroLog | Joern |
 |--------|-------------|-------|
-| File-level recall | 92.3% | 100% (oracle) |
+| File-level recall | 92.3% | 86.7% |
 | Sink-level F1 | 63.4% | — |
 | UAF/DoubleFree detection | Yes (intraprocedural) | Yes |
 | Type safety findings | 147 across 20 files | — |
