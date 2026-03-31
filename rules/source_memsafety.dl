@@ -1,0 +1,511 @@
+// source_memsafety.dl — Memory safety analysis for source code
+//
+// Detects: unguarded tainted sinks, tainted pointer arithmetic,
+// buffer overflow in loops (BOIL), and alloc-copy size mismatch.
+//
+// Consumes: TaintedVar, TaintedSink, DefReachesUse, GuardedSink
+//           (from source_interproc.dl Pass 2 output, recycled to facts/)
+//           + original fact files (Def, Use, Call, etc.)
+//
+// Run as Pass 4 after source_interproc.dl and source_type_safety.dl.
+
+// ── Types ──────────────────────────────────────────────────────────
+.type Addr <: unsigned
+.type Sym  <: symbol
+.type Ver  <: unsigned
+.type Idx  <: unsigned
+
+// ── Input: original facts ──────────────────────────────────────────
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+
+.decl FormalParam(func: Sym, var: Sym, idx: Idx)
+.input FormalParam
+
+.decl CFGEdge(func: Sym, from_addr: Addr, to_addr: Addr)
+.input CFGEdge
+
+.decl Guard(func: Sym, addr: Addr, var: Sym, ver: Ver,
+            op: Sym, bound: Sym, bound_type: Sym)
+.input Guard
+
+.decl ArithOp(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+              op: Sym, src: Sym, src_ver: Ver, operand: Sym)
+.input ArithOp
+
+.decl MemWrite(func: Sym, addr: Addr, target: Sym, mem_in: Ver, mem_out: Ver)
+.input MemWrite
+
+.decl MemRead(func: Sym, addr: Addr, base: Sym, offset: Sym, size: Sym)
+.input MemRead
+
+.decl StackVar(func: Sym, var: Sym, offset: Sym, size: unsigned)
+.input StackVar
+
+.decl VarType(func: Sym, var: Sym, type_name: Sym,
+              width: unsigned, signedness: Sym)
+.input VarType
+
+.decl ReturnVal(func: Sym, var: Sym, ver: Ver)
+.input ReturnVal
+
+// ── Input: derived facts from Pass 2 (recycled to facts/) ─────────
+.decl TaintedVar(func: Sym, var: Sym, def_line: Addr, origin: Sym, ctx: Addr)
+.input TaintedVar
+
+.decl TaintedSink(caller: Sym, callee: Sym, call_addr: Addr,
+                  arg_idx: Idx, tainted_var: Sym, risk: Sym, origin: Sym)
+.input TaintedSink
+
+.decl DefReachesUse(func: Sym, var: Sym, def_line: Addr, use_line: Addr)
+.input DefReachesUse
+
+.decl GuardedSink(caller: Sym, callee: Sym, call_addr: Addr,
+                  guard_var: Sym, guard_op: Sym, guard_bound: Sym)
+.input GuardedSink
+
+// ── Helper: CFG reachability ───────────────────────────────────────
+.decl CFGReach(func: Sym, from_addr: Addr, to_addr: Addr)
+CFGReach(f, a, b) :- CFGEdge(f, a, b).
+CFGReach(f, a, c) :- CFGReach(f, a, b), CFGEdge(f, b, c).
+
+// ── Helper: size-sensitive sinks ───────────────────────────────────
+.decl SizeSensitiveSink(func: Sym, arg_idx: Idx)
+SizeSensitiveSink("malloc",  0).
+SizeSensitiveSink("calloc",  0).
+SizeSensitiveSink("calloc",  1).
+SizeSensitiveSink("realloc", 1).
+SizeSensitiveSink("memcpy",  2).
+SizeSensitiveSink("memmove", 2).
+SizeSensitiveSink("memset",  2).
+SizeSensitiveSink("alloca",  0).
+SizeSensitiveSink("read",    2).
+SizeSensitiveSink("recv",    2).
+SizeSensitiveSink("strncpy", 2).
+SizeSensitiveSink("strncat", 2).
+SizeSensitiveSink("snprintf",1).
+SizeSensitiveSink("fread",   1).
+
+// Function-pointer indirection: hooks->allocate, hooks.allocate, etc.
+// Match via contains() in the TaintedSizeAtSink rule below.
+
+// Alloc functions (for alloc-copy pattern)
+.decl AllocFunc(func: Sym, size_arg: Idx)
+AllocFunc("malloc",  0).
+AllocFunc("calloc",  1).
+AllocFunc("realloc", 1).
+AllocFunc("alloca",  0).
+
+// Copy functions: (func, dst_arg, size_arg)
+.decl CopyFunc(func: Sym, dst_arg: Idx, size_arg: Idx)
+CopyFunc("memcpy",  0, 2).
+CopyFunc("memmove", 0, 2).
+CopyFunc("strncpy", 0, 2).
+CopyFunc("fread",   0, 1).
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 1: UNGUARDED TAINTED SINK
+// ════════════════════════════════════════════════════════════════════
+// Tainted data reaches a dangerous sink with NO bounds check on the
+// tainted variable anywhere in the caller. Highest-confidence findings.
+
+.decl UnguardedTaintedSink(caller: Sym, callee: Sym, call_addr: Addr,
+                           arg_idx: Idx, tainted_var: Sym,
+                           risk: Sym, origin: Sym)
+
+UnguardedTaintedSink(caller, callee, ca, idx, tv, risk, origin) :-
+    TaintedSink(caller, callee, ca, idx, tv, risk, origin),
+    !GuardedSink(caller, callee, ca, _, _, _).
+
+.output UnguardedTaintedSink
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 2: TAINTED POINTER ARITHMETIC
+// ════════════════════════════════════════════════════════════════════
+// Attacker-controlled value used as offset in pointer add/sub.
+// Classic pattern: ptr + tainted_offset → OOB read/write.
+
+.decl TaintedPtrArith(func: Sym, arith_addr: Addr, ptr: Sym,
+                      offset: Sym, op: Sym, origin: Sym)
+
+// Tainted offset added to pointer
+TaintedPtrArith(f, aa, src, operand, op, origin) :-
+    ArithOp(f, aa, _, _, op, src, _, operand),
+    (op = "add" ; op = "sub"),
+    VarType(f, src, _, _, "pointer"),
+    TaintedVar(f, operand, op_def, origin, _),
+    DefReachesUse(f, operand, op_def, aa).
+
+// Tainted base with constant/variable offset (symmetric)
+TaintedPtrArith(f, aa, operand, src, op, origin) :-
+    ArithOp(f, aa, _, _, op, src, _, operand),
+    (op = "add" ; op = "sub"),
+    VarType(f, operand, _, _, "pointer"),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, aa).
+
+// Tainted index in array-style access (ArithOp with mul for scaling)
+TaintedPtrArith(f, aa, dst, src, "index_scale", origin) :-
+    ArithOp(f, aa, dst, _, "mul", src, _, _),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, aa),
+    // Result used in pointer arithmetic or as memcpy offset
+    Def(f, dst, _, aa),
+    Use(f, dst, _, use_a),
+    ArithOp(f, use_a, _, _, "add", _, _, _).
+
+.output TaintedPtrArith
+
+// Unguarded tainted pointer arithmetic — no bounds check
+.decl UnguardedTaintedPtrArith(func: Sym, arith_addr: Addr, ptr: Sym,
+                               offset: Sym, op: Sym, origin: Sym)
+
+UnguardedTaintedPtrArith(f, aa, ptr, offset, op, origin) :-
+    TaintedPtrArith(f, aa, ptr, offset, op, origin),
+    !Guard(f, _, offset, _, _, _, _).
+
+.output UnguardedTaintedPtrArith
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 3: BUFFER OVERFLOW IN LOOP (BOIL)
+// ════════════════════════════════════════════════════════════════════
+// Tainted value controls loop iteration count, and a buffer write
+// occurs in the loop body. Classic pattern:
+//   for (i = 0; i < tainted_len; i++) buf[i] = src[i];
+
+// Detect loop-like guards (comparison with tainted bound)
+.decl TaintedLoopBound(func: Sym, guard_addr: Addr, loop_var: Sym,
+                       bound_var: Sym, op: Sym, origin: Sym)
+
+// Accept both symbolic (lt, le, ne) and literal (<, <=, !=) operator names,
+// and both "variable"/"var" bound types — LLM extraction may use either form.
+TaintedLoopBound(f, ga, lv, bv, op, origin) :-
+    Guard(f, ga, lv, _, op, bv, bt),
+    (bt = "variable" ; bt = "var"),
+    (op = "lt" ; op = "le" ; op = "unsigned_lt" ; op = "unsigned_le" ;
+     op = "ne" ; op = "<" ; op = "<=" ; op = "!="),
+    TaintedVar(f, bv, bv_def, origin, _),
+    DefReachesUse(f, bv, bv_def, ga).
+
+// Also detect when the loop variable itself is tainted
+// (e.g., while (*tainted_ptr++) style)
+TaintedLoopBound(f, ga, lv, lv, op, origin) :-
+    Guard(f, ga, lv, _, op, _, _),
+    (op = "lt" ; op = "le" ; op = "ne" ; op = "<" ; op = "<=" ; op = "!="),
+    TaintedVar(f, lv, lv_def, origin, _),
+    DefReachesUse(f, lv, lv_def, ga).
+
+.output TaintedLoopBound
+
+// BOIL: tainted loop bound + write in the loop body
+.decl BufferOverflowInLoop(func: Sym, guard_addr: Addr, bound_var: Sym,
+                           write_addr: Addr, write_type: Sym, origin: Sym)
+
+// MemWrite in loop body after tainted guard
+BufferOverflowInLoop(f, ga, bv, wa, "mem_write", origin) :-
+    TaintedLoopBound(f, ga, _, bv, _, origin),
+    MemWrite(f, wa, _, _, _),
+    CFGReach(f, ga, wa).
+
+// Call to copy function (memcpy, strcpy, etc.) in loop body
+BufferOverflowInLoop(f, ga, bv, ca, callee, origin) :-
+    TaintedLoopBound(f, ga, _, bv, _, origin),
+    Call(f, callee, ca),
+    (callee = "memcpy" ; callee = "memmove" ; callee = "strcpy" ;
+     callee = "strncpy" ; callee = "strcat"),
+    CFGReach(f, ga, ca).
+
+// Loop variable used as index in array write (ArithOp + MemWrite)
+BufferOverflowInLoop(f, ga, bv, wa, "indexed_write", origin) :-
+    TaintedLoopBound(f, ga, lv, bv, _, origin),
+    ArithOp(f, _, idx, _, "add", _, _, lv),
+    MemWrite(f, wa, idx, _, _),
+    CFGReach(f, ga, wa).
+
+.output BufferOverflowInLoop
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 4: ALLOC-COPY SIZE MISMATCH
+// ════════════════════════════════════════════════════════════════════
+// malloc(n) then memcpy(buf, src, m) where n and m are derived from
+// different tainted values, or m is tainted but n is not.
+// Classic heap overflow: allocate with one size, copy with another.
+
+// Track which variable holds the allocated buffer
+.decl AllocSite(func: Sym, call_addr: Addr, buf_var: Sym,
+                size_var: Sym, alloc_func: Sym)
+
+// malloc/calloc/realloc return assigned to buf_var
+AllocSite(f, ca, buf, size_v, callee) :-
+    Call(f, callee, ca),
+    AllocFunc(callee, size_idx),
+    ActualArg(ca, size_idx, _, size_v, _),
+    ReturnVal(callee, _, _),
+    Def(f, buf, _, ca).
+
+// Also match: buf = malloc(size) where buf is defined at the call line
+// (common when LLM extracts "buf" as Def at the call address)
+AllocSite(f, ca, buf, size_v, callee) :-
+    Call(f, callee, ca),
+    AllocFunc(callee, size_idx),
+    ActualArg(ca, size_idx, _, size_v, _),
+    Def(f, buf, _, ca),
+    VarType(f, buf, _, _, "pointer").
+
+.output AllocSite
+
+// Track copy operations on the allocated buffer
+.decl CopySite(func: Sym, call_addr: Addr, dst_var: Sym,
+               size_var: Sym, copy_func: Sym)
+
+CopySite(f, ca, dst, size_v, callee) :-
+    Call(f, callee, ca),
+    CopyFunc(callee, dst_idx, size_idx),
+    ActualArg(ca, dst_idx, _, dst, _),
+    ActualArg(ca, size_idx, _, size_v, _).
+
+.output CopySite
+
+// Pattern A: alloc with size A, copy with DIFFERENT size B (both tainted)
+.decl AllocCopyMismatch(func: Sym, alloc_addr: Addr, copy_addr: Addr,
+                        buf: Sym, alloc_size: Sym, copy_size: Sym,
+                        alloc_func: Sym, copy_func: Sym,
+                        alloc_origin: Sym, copy_origin: Sym)
+
+AllocCopyMismatch(f, aa, ca, buf, asz, csz, af, cf, a_origin, c_origin) :-
+    AllocSite(f, aa, buf, asz, af),
+    DefReachesUse(f, buf, aa, ca),
+    CopySite(f, ca, buf, csz, cf),
+    asz != csz,
+    TaintedVar(f, asz, _, a_origin, _),
+    TaintedVar(f, csz, _, c_origin, _).
+
+// Pattern B: alloc with UNTAINTED size, copy with TAINTED size
+// (attacker controls copy length but not allocation — direct overflow)
+AllocCopyMismatch(f, aa, ca, buf, asz, csz, af, cf, "none", c_origin) :-
+    AllocSite(f, aa, buf, asz, af),
+    DefReachesUse(f, buf, aa, ca),
+    CopySite(f, ca, buf, csz, cf),
+    !TaintedVar(f, asz, _, _, _),
+    TaintedVar(f, csz, _, c_origin, _).
+
+// Pattern C: alloc with tainted size, then UNBOUNDED copy (strcpy)
+// strcpy doesn't take a size arg — always potential overflow
+.decl AllocThenUnboundedCopy(func: Sym, alloc_addr: Addr, copy_addr: Addr,
+                             buf: Sym, alloc_size: Sym,
+                             alloc_func: Sym, copy_func: Sym, origin: Sym)
+
+AllocThenUnboundedCopy(f, aa, ca, buf, asz, af, callee, origin) :-
+    AllocSite(f, aa, buf, asz, af),
+    TaintedVar(f, asz, _, origin, _),
+    DefReachesUse(f, buf, aa, ca),
+    Call(f, callee, ca),
+    (callee = "strcpy" ; callee = "strcat" ; callee = "sprintf"),
+    ActualArg(ca, 0, _, buf, _).
+
+.output AllocCopyMismatch
+.output AllocThenUnboundedCopy
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 5: UNCHECKED ALLOCATION RETURN
+// ════════════════════════════════════════════════════════════════════
+// malloc/calloc/realloc return value used without NULL check.
+
+.decl UncheckedAlloc(func: Sym, alloc_addr: Addr, buf_var: Sym,
+                     use_addr: Addr, alloc_func: Sym)
+
+UncheckedAlloc(f, aa, buf, use_a, af) :-
+    AllocSite(f, aa, buf, _, af),
+    DefReachesUse(f, buf, aa, use_a),
+    Use(f, buf, _, use_a),
+    use_a != aa,
+    // No NULL check between alloc and use
+    !Guard(f, _, buf, _, "ne", "NULL", _),
+    !Guard(f, _, buf, _, "ne", "0", _),
+    !Guard(f, _, buf, _, "eq", "NULL", _),
+    !Guard(f, _, buf, _, "eq", "0", _).
+
+.output UncheckedAlloc
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 6: TAINTED SIZE AT SIZE-SENSITIVE SINK (without guard)
+// ════════════════════════════════════════════════════════════════════
+// Unified detection: tainted value used as size argument at any
+// size-sensitive function, without any bounds check.
+
+.decl TaintedSizeAtSink(func: Sym, call_addr: Addr, callee: Sym,
+                        size_var: Sym, arg_idx: Idx, origin: Sym)
+
+TaintedSizeAtSink(f, ca, callee, sv, idx, origin) :-
+    Call(f, callee, ca),
+    SizeSensitiveSink(callee, idx),
+    ActualArg(ca, idx, _, sv, _),
+    TaintedVar(f, sv, sv_def, origin, _),
+    DefReachesUse(f, sv, sv_def, ca).
+
+// Function-pointer indirection: hooks->allocate(size) wraps malloc(size)
+TaintedSizeAtSink(f, ca, callee, sv, 0, origin) :-
+    Call(f, callee, ca),
+    (contains("allocate", callee) ; contains("malloc", callee)),
+    ActualArg(ca, 0, _, sv, _),
+    TaintedVar(f, sv, sv_def, origin, _),
+    DefReachesUse(f, sv, sv_def, ca).
+
+.output TaintedSizeAtSink
+
+.decl UnguardedTaintedSize(func: Sym, call_addr: Addr, callee: Sym,
+                           size_var: Sym, arg_idx: Idx, origin: Sym)
+
+UnguardedTaintedSize(f, ca, callee, sv, idx, origin) :-
+    TaintedSizeAtSink(f, ca, callee, sv, idx, origin),
+    !Guard(f, _, sv, _, _, _, _).
+
+.output UnguardedTaintedSize
+
+// ════════════════════════════════════════════════════════════════════
+// USE-AFTER-FREE (Intraprocedural)
+// ════════════════════════════════════════════════════════════════════
+// Pattern: free(ptr) at line F, then ptr used at line U, with no
+// reassignment of ptr on any CFG path between F and U.
+//
+// We use DefReachesUse to check: if the definition of ptr that reaches
+// the free call ALSO reaches the post-free use, then ptr was NOT
+// reassigned between the free and the use.
+
+// Step 1: Identify free sites — which variable is freed at which line.
+// Handles direct free(), function-pointer wrappers (hooks->deallocate),
+// and C++ delete-like patterns.
+.decl FreedVar(func: Sym, var: Sym, free_line: Addr)
+
+FreedVar(f, ptr, fa) :-
+    Call(f, callee, fa),
+    (callee = "free" ; contains("free", callee) ; contains("deallocate", callee)),
+    ActualArg(fa, 0, _, ptr, _).
+
+// Step 2: Use-after-free — ptr is used after being freed, and the same
+// definition that reached the free also reaches the post-free use
+// (meaning ptr was NOT reassigned between free and use).
+.decl UseAfterFree(func: Sym, var: Sym, free_line: Addr, use_line: Addr)
+
+UseAfterFree(f, ptr, fa, ua) :-
+    FreedVar(f, ptr, fa),
+    Use(f, ptr, _, ua),
+    CFGReach(f, fa, ua),            // use is reachable after free
+    ua != fa,                        // not the free call itself
+    // Same def reaches both free and use → no reassignment between them
+    DefReachesUse(f, ptr, d, fa),
+    DefReachesUse(f, ptr, d, ua).
+
+.output UseAfterFree
+
+// Step 3: NULL-guarded UAF is lower priority — track which UAFs have a
+// NULL check between free and use (common pattern: free(p); p = NULL;
+// if (p) use(p); — this is safe).
+.decl GuardedUAF(func: Sym, var: Sym, free_line: Addr, use_line: Addr)
+
+GuardedUAF(f, ptr, fa, ua) :-
+    UseAfterFree(f, ptr, fa, ua),
+    Guard(f, ga, ptr, _, op, _, _),
+    (op = "==" ; op = "!=" ; op = "eq" ; op = "ne"),
+    CFGReach(f, fa, ga),
+    CFGReach(f, ga, ua).
+
+// Unguarded UAF: the most actionable finding
+.decl UnguardedUAF(func: Sym, var: Sym, free_line: Addr, use_line: Addr)
+
+UnguardedUAF(f, ptr, fa, ua) :-
+    UseAfterFree(f, ptr, fa, ua),
+    !GuardedUAF(f, ptr, fa, ua).
+
+.output UnguardedUAF
+
+// ════════════════════════════════════════════════════════════════════
+// DOUBLE-FREE (Intraprocedural)
+// ════════════════════════════════════════════════════════════════════
+// Pattern: free(ptr) at line F1, then free(ptr) again at line F2,
+// with no reassignment of ptr between F1 and F2 (ptr still points
+// to the same already-freed object).
+
+.decl DoubleFree(func: Sym, var: Sym, free1_line: Addr, free2_line: Addr)
+
+DoubleFree(f, ptr, fa1, fa2) :-
+    FreedVar(f, ptr, fa1),
+    FreedVar(f, ptr, fa2),
+    fa1 != fa2,
+    CFGReach(f, fa1, fa2),          // second free reachable from first
+    // Same def reaches both free sites → no reassignment between them
+    DefReachesUse(f, ptr, d, fa1),
+    DefReachesUse(f, ptr, d, fa2).
+
+// Guarded double-free: free inside if-else branches (common, often safe)
+.decl GuardedDoubleFree(func: Sym, var: Sym, free1: Addr, free2: Addr)
+
+GuardedDoubleFree(f, ptr, fa1, fa2) :-
+    DoubleFree(f, ptr, fa1, fa2),
+    Guard(f, ga, ptr, _, op, _, _),
+    (op = "==" ; op = "!=" ; op = "eq" ; op = "ne"),
+    CFGReach(f, fa1, ga),
+    CFGReach(f, ga, fa2).
+
+.decl UnguardedDoubleFree(func: Sym, var: Sym, free1: Addr, free2: Addr)
+
+UnguardedDoubleFree(f, ptr, fa1, fa2) :-
+    DoubleFree(f, ptr, fa1, fa2),
+    !GuardedDoubleFree(f, ptr, fa1, fa2).
+
+.output DoubleFree
+.output UnguardedDoubleFree
+
+// ════════════════════════════════════════════════════════════════════
+// SUMMARY: All memory safety findings in one relation
+// ════════════════════════════════════════════════════════════════════
+
+.decl MemSafetyFinding(func: Sym, addr: Addr, category: Sym,
+                       var: Sym, detail: Sym)
+
+MemSafetyFinding(f, ca, "unguarded_tainted_sink", tv,
+    cat(callee, cat(" arg", cat(to_string(idx), cat(" risk=", cat(risk, cat(" origin=", origin))))))) :-
+    UnguardedTaintedSink(f, callee, ca, idx, tv, risk, origin).
+
+MemSafetyFinding(f, aa, "tainted_ptr_arith", ptr,
+    cat(op, cat(" offset=", cat(offset, cat(" origin=", origin))))) :-
+    TaintedPtrArith(f, aa, ptr, offset, op, origin).
+
+MemSafetyFinding(f, ga, "buffer_overflow_in_loop", bv,
+    cat(wt, cat(" at line ", cat(to_string(wa), cat(" origin=", origin))))) :-
+    BufferOverflowInLoop(f, ga, bv, wa, wt, origin).
+
+MemSafetyFinding(f, ca, "alloc_copy_mismatch", buf,
+    cat(af, cat("(", cat(asz, cat(") then ", cat(cf, cat("(", cat(csz, ")")))))))) :-
+    AllocCopyMismatch(f, _, ca, buf, asz, csz, af, cf, _, _).
+
+MemSafetyFinding(f, ca, "alloc_then_unbounded_copy", buf,
+    cat(af, cat("→", cat(cf, cat(" origin=", origin))))) :-
+    AllocThenUnboundedCopy(f, _, ca, buf, _, af, cf, origin).
+
+MemSafetyFinding(f, aa, "unchecked_alloc", buf,
+    cat(af, cat(" used_at=", to_string(ua)))) :-
+    UncheckedAlloc(f, aa, buf, ua, af).
+
+MemSafetyFinding(f, ca, "unguarded_tainted_size", sv,
+    cat(callee, cat(" arg", cat(to_string(idx), cat(" origin=", origin))))) :-
+    UnguardedTaintedSize(f, ca, callee, sv, idx, origin).
+
+MemSafetyFinding(f, fa, "use_after_free", ptr,
+    cat("freed at ", cat(to_string(fa), cat(" used at ", to_string(ua))))) :-
+    UnguardedUAF(f, ptr, fa, ua).
+
+MemSafetyFinding(f, fa1, "double_free", ptr,
+    cat("first free at ", cat(to_string(fa1), cat(" second at ", to_string(fa2))))) :-
+    UnguardedDoubleFree(f, ptr, fa1, fa2).
+
+.output MemSafetyFinding

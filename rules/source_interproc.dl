@@ -1,0 +1,677 @@
+// source_interproc.dl — Full interprocedural taint analysis for source code
+//
+// Combines reaching definitions, intraprocedural taint, and 1-CFA
+// context-sensitive interprocedural propagation.  Self-contained.
+//
+// Key improvement over bin_datalog rules:
+//   - (var, def_line) replaces (var, ver) — no SSA required
+//   - Taint gated by reaching definitions — sanitization kills taint
+//   - Phi merges handled implicitly by CFG (no PhiSource needed)
+
+// ── Types ──────────────────────────────────────────────────────────
+.type Addr <: unsigned
+.type Sym  <: symbol
+.type Ver  <: unsigned
+.type Idx  <: unsigned
+
+// ── Input relations ────────────────────────────────────────────────
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+
+.decl ReturnVal(func: Sym, var: Sym, ver: Ver)
+.input ReturnVal
+
+.decl CFGEdge(func: Sym, from_addr: Addr, to_addr: Addr)
+.input CFGEdge
+
+.decl AddressOf(func: Sym, var: Sym, ver: Ver, target: Sym)
+.input AddressOf
+
+.decl FieldRead(func: Sym, addr: Addr, base: Sym, field: Sym)
+.input FieldRead
+
+.decl FieldWrite(func: Sym, addr: Addr, base: Sym, field: Sym, mem_in: Ver, mem_out: Ver)
+.input FieldWrite
+
+.decl MemRead(func: Sym, addr: Addr, base: Sym, offset: Sym, size: Sym)
+.input MemRead
+
+.decl MemWrite(func: Sym, addr: Addr, target: Sym, mem_in: Ver, mem_out: Ver)
+.input MemWrite
+
+.decl FormalParam(func: Sym, var: Sym, idx: Idx)
+.input FormalParam
+
+.decl Guard(func: Sym, addr: Addr, var: Sym, ver: Ver, op: Sym, bound: Sym, bound_type: Sym)
+.input Guard
+
+.decl PhiSource(func: Sym, var: Sym, def_ver: Ver, src_var: Sym, src_ver: Ver)
+.input PhiSource
+
+// Alias analysis (from separate alias pass, if available)
+.decl PointsTo(func: Sym, var: Sym, ver: Ver, obj: Sym)
+.input PointsTo
+
+// Library signatures
+.decl TaintTransfer(func: Sym, out_arg: Sym, in_arg: Sym)
+.input TaintTransfer
+
+.decl TaintKill(func: Sym, arg_idx: Idx)
+.input TaintKill
+
+// Buffer-write source (for heap taint)
+.decl BufferWriteSource(func: Sym, arg_idx: Idx)
+.input BufferWriteSource
+
+// Entry-point taint (user-specified attack surface)
+.decl EntryTaint(func: Sym, param_idx: Idx)
+.input EntryTaint
+
+// ════════════════════════════════════════════════════════════════════
+// DEFENSIVE DEF INFERENCE — Source code adaptation
+// ════════════════════════════════════════════════════════════════════
+// In MLIL-SSA (binary analysis), the decompiler makes output params
+// explicit: `buf#1 = fgets(buf#0, n, stream)`. In source code, the
+// LLM may not emit Def for output parameters because there's no LHS
+// assignment visible. These rules defensively infer Def facts.
+//
+// We unconditionally add Def for output params — Souffle deduplicates
+// if the LLM already emitted the Def. No negation needed.
+
+// Output params of taint source functions (fgets, fread, scanf, etc.)
+Def(caller, v, 0, ca) :-
+    Call(caller, callee, ca),
+    TaintSourceFunc(callee),
+    ActualArg(ca, _, _, v, _).
+
+// Output params via BufferWriteSource signatures
+Def(caller, v, 0, ca) :-
+    Call(caller, callee, ca),
+    BufferWriteSource(callee, idx),
+    ActualArg(ca, idx, _, v, _).
+
+// Output params via TaintTransfer (destination args of memcpy, strcpy, etc.)
+Def(caller, v, 0, ca) :-
+    Call(caller, callee, ca),
+    TaintTransfer(callee, out_str, _),
+    out_str != "return",
+    ArgStr(out_idx, out_str),
+    ActualArg(ca, out_idx, _, v, _).
+
+// ── User-defined function output params (pass-by-pointer side effects) ──
+// If callee has multiple Defs for a formal param (initial + write inside),
+// the callee modifies that param. Propagate Def to caller's actual arg.
+
+.decl FuncModifiesParam(func: Sym, idx: Idx)
+FuncModifiesParam(f, idx) :-
+    FormalParam(f, p, idx),
+    Def(f, p, _, d1),
+    Def(f, p, _, d2),
+    d1 != d2.
+
+// MemWrite to a formal param also indicates output param modification
+// Pattern: *index = parsed_index; where index is a pointer param
+FuncModifiesParam(f, idx) :-
+    FormalParam(f, p, idx),
+    MemWrite(f, _, p, _, _).
+
+Def(caller, v, 0, ca) :-
+    Call(caller, callee, ca),
+    FuncModifiesParam(callee, idx),
+    ActualArg(ca, idx, _, v, _).
+
+// ════════════════════════════════════════════════════════════════════
+// REACHING DEFINITIONS
+// ════════════════════════════════════════════════════════════════════
+
+.decl Kills(func: Sym, var: Sym, node: Addr)
+Kills(f, v, n) :- Def(f, v, _, n).
+
+.decl ReachesIn(func: Sym, var: Sym, def_line: Addr, node: Addr)
+ReachesIn(f, v, d, n) :-
+    ReachesOut(f, v, d, pred),
+    CFGEdge(f, pred, n).
+
+.decl ReachesOut(func: Sym, var: Sym, def_line: Addr, node: Addr)
+
+// Gen: a definition always reaches the exit of its own line.
+ReachesOut(f, v, d, d) :- Def(f, v, _, d).
+
+// Propagate: incoming def survives if not killed.
+ReachesOut(f, v, d, n) :-
+    ReachesIn(f, v, d, n),
+    !Kills(f, v, n).
+
+// Def at def_line reaches the use at use_line.
+.decl DefReachesUse(func: Sym, var: Sym, def_line: Addr, use_line: Addr)
+DefReachesUse(f, v, d, u) :-
+    ReachesIn(f, v, d, u),
+    Use(f, v, _, u).
+
+.output DefReachesUse
+
+// ── CFG Reachability (transitive closure) ──────────────────────────
+// Used by taint-controlled reachability: guard dominates sink.
+.decl CFGReach(func: Sym, from_addr: Addr, to_addr: Addr)
+CFGReach(f, a, b) :- CFGEdge(f, a, b).
+CFGReach(f, a, c) :- CFGReach(f, a, b), CFGEdge(f, b, c).
+
+// ════════════════════════════════════════════════════════════════════
+// TAINT CONFIGURATION
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintSourceFunc(name: Sym)
+TaintSourceFunc("read").
+TaintSourceFunc("recv").
+TaintSourceFunc("fread").
+TaintSourceFunc("fgets").
+TaintSourceFunc("fgetc").
+TaintSourceFunc("getchar").
+TaintSourceFunc("gets").
+TaintSourceFunc("getenv").
+TaintSourceFunc("scanf").
+TaintSourceFunc("fscanf").
+TaintSourceFunc("getline").
+
+.decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
+DangerousSink("memcpy",  2, "buffer_overflow").
+DangerousSink("memcpy",  1, "buffer_overflow").
+DangerousSink("memmove", 2, "buffer_overflow").
+DangerousSink("memset",  2, "buffer_overflow").
+DangerousSink("strcpy",  1, "buffer_overflow").
+DangerousSink("strncpy", 2, "buffer_overflow").
+DangerousSink("sprintf", 1, "format_string").   // fmt arg (user-controlled format)
+DangerousSink("snprintf",2, "format_string").   // fmt arg
+DangerousSink("system",  0, "command_injection").
+DangerousSink("free",    0, "double_free").
+DangerousSink("strcat",  1, "buffer_overflow").
+DangerousSink("strncat", 1, "buffer_overflow").
+DangerousSink("printf",  0, "format_string").   // fmt arg — ONLY arg0 is dangerous
+DangerousSink("fprintf", 1, "format_string").   // fmt arg
+DangerousSink("malloc",  0, "heap_overflow").
+DangerousSink("calloc",  0, "heap_overflow").
+DangerousSink("calloc",  1, "heap_overflow").
+DangerousSink("realloc", 1, "heap_overflow").
+
+// Arg string ↔ index mapping for TaintTransfer rules
+.decl ArgStr(idx: Idx, str: Sym)
+ArgStr(0, "arg0"). ArgStr(1, "arg1"). ArgStr(2, "arg2").
+ArgStr(3, "arg3"). ArgStr(4, "arg4"). ArgStr(5, "arg5").
+
+// ════════════════════════════════════════════════════════════════════
+// TAINT STATE — 1-CFA context-sensitive
+// ════════════════════════════════════════════════════════════════════
+// TaintedVar(func, var, def_line, origin, ctx)
+//   def_line: line where this variable's tainted value was defined
+//   origin:   human-readable taint source description
+//   ctx:      call address that introduced taint into this function (1-CFA)
+//             ctx=0 for top-level / external taint origins
+
+.decl TaintedVar(func: Sym, var: Sym, def_line: Addr, origin: Sym, ctx: Addr)
+
+// ── Entry-point taint (user-specified) ─────────────────────────────
+TaintedVar(f, v, d, cat("entry:", cat(f, cat(":arg", to_string(idx)))), 0) :-
+    EntryTaint(f, idx),
+    FormalParam(f, v, idx),
+    Def(f, v, _, d).
+
+// ── Rule 1: External taint sources ─────────────────────────────────
+
+// Args passed to source functions become tainted (source writes into them)
+TaintedVar(caller, v, ca, cat("arg_to_", callee), ca) :-
+    Call(caller, callee, ca),
+    TaintSourceFunc(callee),
+    ActualArg(ca, _, _, v, _).
+
+// Return values from source functions are tainted
+TaintedVar(caller, v, ca, cat("ret_from_", callee), ca) :-
+    Call(caller, callee, ca),
+    TaintSourceFunc(callee),
+    Def(caller, v, _, ca).
+
+// TaintTransfer "external" sources (library signatures)
+TaintedVar(caller, v, ca, cat("external_via_", callee), ca) :-
+    Call(caller, callee, ca),
+    TaintTransfer(callee, out_str, "external"),
+    ArgStr(out_idx, out_str),
+    ActualArg(ca, out_idx, _, v, _).
+
+TaintedVar(caller, v, ca, cat("external_via_", callee), ca) :-
+    Call(caller, callee, ca),
+    TaintTransfer(callee, "return", "external"),
+    Def(caller, v, _, ca).
+
+// ── Rule 2: Intraprocedural propagation (gated by reaching defs) ──
+
+// Assignment: tainted src flows to dst IF src's tainted def reaches the use.
+TaintedVar(f, dst, addr, origin, ctx) :-
+    TaintedVar(f, src, src_def, origin, ctx),
+    DefReachesUse(f, src, src_def, addr),
+    Def(f, dst, _, addr),
+    dst != src.
+
+// Self-assignment: x = x + 1, x++, x += n — taint carries through.
+// The variable is both used and redefined at the same line.
+TaintedVar(f, v, addr, origin, ctx) :-
+    TaintedVar(f, v, v_def, origin, ctx),
+    DefReachesUse(f, v, v_def, addr),
+    Def(f, v, _, addr),
+    addr != v_def.
+
+// ── Rule 3: Pointer-to-buffer propagation ──────────────────────────
+.decl TaintedBuffer(func: Sym, buffer: Sym, origin: Sym, ctx: Addr)
+
+TaintedBuffer(f, target, origin, ctx) :-
+    TaintedVar(f, v, v_def, origin, ctx),
+    AddressOf(f, v, _, target),
+    Def(f, v, _, v_def).
+
+// Reading from tainted buffer taints destination
+TaintedVar(f, dv, addr, origin, ctx) :-
+    TaintedBuffer(f, buf, origin, ctx),
+    MemRead(f, addr, buf, _, _),
+    Def(f, dv, _, addr).
+
+// ── Rule 2c: Address-of dereference — &var tainted implies var tainted ──
+// When output params return tainted data, the actual arg is "&var" but the
+// caller uses "var". Bridge this gap.
+TaintedVar(f, v, d, origin, ctx) :-
+    TaintedVar(f, av, d, origin, ctx),
+    av = cat("&", v),
+    Def(f, v, _, vd),
+    DefReachesUse(f, v, vd, _).
+
+// ── Rule 3b: MemWrite taint propagation ───────────────────────────
+// Writing tainted data through a pointer taints the target variable.
+// Pattern: *target = tainted_value  →  target becomes tainted
+// Critical for output-parameter propagation (e.g., decode_array_index writes
+// tainted parsed_index to *index output param).
+TaintedVar(f, target, addr, origin, ctx) :-
+    TaintedVar(f, src, src_def, origin, ctx),
+    DefReachesUse(f, src, src_def, addr),
+    MemWrite(f, addr, target, _, _).
+
+// ── Rule 4: Library function taint transfer ────────────────────────
+
+// Transfer between args (e.g., memcpy: dst ← src)
+TaintedVar(caller, out_v, ca, origin, ctx) :-
+    TaintedVar(caller, in_v, in_def, origin, ctx),
+    DefReachesUse(caller, in_v, in_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, in_idx, _, in_v, _),
+    ArgStr(in_idx, in_str),
+    TaintTransfer(callee, out_str, in_str),
+    out_str != "return",
+    ArgStr(out_idx, out_str),
+    ActualArg(ca, out_idx, _, out_v, _).
+
+// Transfer to return value
+TaintedVar(caller, ret_v, ca, origin, ctx) :-
+    TaintedVar(caller, in_v, in_def, origin, ctx),
+    DefReachesUse(caller, in_v, in_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, in_idx, _, in_v, _),
+    ArgStr(in_idx, in_str),
+    TaintTransfer(callee, "return", in_str),
+    Def(caller, ret_v, _, ca).
+
+// ── Rule 5: Interprocedural — caller to callee ────────────────────
+// Tainted actual arg → callee's formal param.  ctx = call address.
+TaintedVar(callee, param, param_def, origin, ca) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    FormalParam(callee, param, idx),
+    Def(callee, param, _, param_def).
+
+// ── Rule 5b: Expression args — tainted base var in argument expression ──
+// When ActualArg is an expression like "line + 8" but the tainted base
+// variable "line" is Used at the call site, propagate taint to the callee.
+// This handles cases where the LLM extracts expressions instead of variable names.
+TaintedVar(callee, param, param_def, origin, ca) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    Use(caller, v, _, ca),
+    !ActualArg(ca, _, _, v, _),       // v isn't directly an argument name
+    ActualArg(ca, idx, _, _, _),      // but there IS an argument at idx
+    FormalParam(callee, param, idx),
+    Def(callee, param, _, param_def).
+
+// ── Rule 6: Interprocedural — callee return to caller ──────────────
+// Tainted return value propagates back to caller's def at call site.
+TaintedVar(caller, cv, ca, origin, ca) :-
+    TaintedVar(callee, rv, rv_def, origin, _),
+    ReturnVal(callee, rv, _),
+    DefReachesUse(callee, rv, rv_def, ret_use),
+    Use(callee, rv, _, ret_use),
+    Call(caller, callee, ca),
+    Def(caller, cv, _, ca).
+
+// ── Rule 6b: Callee side-effect — tainted param flows back to caller ──
+// When a callee taints a formal parameter (e.g., fgets writes into buffer
+// param), propagate taint back to the caller's actual argument.
+// This handles pass-by-pointer side effects that Rule 6 (return values) misses.
+TaintedVar(caller, v, ca, origin, ca) :-
+    TaintedVar(callee, param, _, origin, _),
+    FormalParam(callee, param, idx),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _).
+
+// ── Rule 7: Field taint propagation ────────────────────────────────
+.decl TaintedField(func: Sym, base: Sym, field: Sym, origin: Sym, ctx: Addr)
+
+// Writing tainted data to a field
+TaintedField(f, base, field, origin, ctx) :-
+    TaintedVar(f, v, v_def, origin, ctx),
+    DefReachesUse(f, v, v_def, addr),
+    FieldWrite(f, addr, base, field, _, _).
+
+// Reading a tainted field
+TaintedVar(f, dv, addr, origin, ctx) :-
+    TaintedField(f, base, field, origin, ctx),
+    FieldRead(f, addr, base, field),
+    Def(f, dv, _, addr).
+
+// Tainted field via macro/inline call: if callee has no body (macro),
+// and arg expression references tainted-field base, taint the return var.
+// Handles patterns like: ptr = buffer_at_offset(input_buffer) where
+// buffer_at_offset is a #define that accesses input_buffer->content.
+TaintedVar(f, dv, ca, origin, ctx) :-
+    TaintedField(f, base, _field, origin, ctx),
+    Call(f, callee, ca),
+    ActualArg(ca, _, _, base, _),
+    !FormalParam(callee, _, _),
+    Def(f, dv, _, ca).
+
+// Same rule but for expression args containing the base (e.g., &base)
+TaintedVar(f, dv, ca, origin, ctx) :-
+    TaintedField(f, base, _field, origin, ctx),
+    Call(f, callee, ca),
+    ActualArg(ca, _, _, arg_expr, _),
+    contains(base, arg_expr),
+    arg_expr != base,
+    strlen(base) > 1,
+    !FormalParam(callee, _, _),
+    Def(f, dv, _, ca).
+
+// Interprocedural field taint: caller → callee (exact match)
+TaintedField(callee, param, field, origin, ca) :-
+    TaintedField(caller, base, field, origin, _),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, base, _),
+    FormalParam(callee, param, idx).
+
+// Interprocedural field taint: caller → callee (address-of: &base)
+TaintedField(callee, param, field, origin, ca) :-
+    TaintedField(caller, base, field, origin, _),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, arg_expr, _),
+    arg_expr = cat("&", base),
+    FormalParam(callee, param, idx).
+
+// Interprocedural field taint: caller → callee (expression contains base)
+// Handles patterns like func(&buffer), wrapper(func(&buffer)), casts
+TaintedField(callee, param, field, origin, ca) :-
+    TaintedField(caller, base, field, origin, _),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, arg_expr, _),
+    contains(base, arg_expr),
+    arg_expr != base,  // avoid duplicate with exact-match rule
+    strlen(base) > 1,  // avoid spurious matches on single-char names
+    FormalParam(callee, param, idx).
+
+// Interprocedural field taint: callee → caller
+TaintedField(caller, arg_v, field, origin, ca) :-
+    TaintedField(callee, param, field, origin, ca),
+    FormalParam(callee, param, idx),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, arg_v, _).
+
+// Tainted field → MemWrite: writing from tainted struct field into a buffer.
+// Pattern: buf[i] = macro(tainted_base)[j] at same line.
+// The base variable is Used at the MemWrite address and has a tainted field.
+TaintedBuffer(f, buf, origin, ctx) :-
+    TaintedField(f, base, _field, origin, ctx),
+    Use(f, base, _, addr),
+    MemWrite(f, addr, buf, _, _),
+    buf != base.
+
+// ── Rule 8: Heap object taint (via PointsTo) ───────────────────────
+.decl TaintedHeapObject(obj: Sym, origin: Sym)
+
+TaintedHeapObject(obj, cat("bufwrite_via_", callee)) :-
+    Call(caller, callee, ca),
+    BufferWriteSource(callee, idx),
+    ActualArg(ca, idx, _, v, _),
+    PointsTo(caller, v, _, obj).
+
+// Load from tainted heap object
+TaintedVar(f, dv, addr, origin, 0) :-
+    TaintedHeapObject(obj, origin),
+    PointsTo(f, ptr, _, obj),
+    Use(f, ptr, _, load_addr),
+    MemRead(f, load_addr, _, _, _),
+    Def(f, dv, _, addr),
+    addr = load_addr.
+
+// Pass pointer to tainted heap object interprocedurally
+TaintedVar(callee, param, param_def, origin, ca) :-
+    TaintedHeapObject(obj, origin),
+    PointsTo(caller, v, _, obj),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    FormalParam(callee, param, idx),
+    Def(callee, param, _, param_def).
+
+// ── Sanitizer: TaintKill ───────────────────────────────────────────
+.decl SanitizedVar(func: Sym, var: Sym, def_line: Addr, kill_func: Sym, kill_addr: Addr)
+
+SanitizedVar(caller, v, v_def, callee, ca) :-
+    Call(caller, callee, ca),
+    TaintKill(callee, idx),
+    ActualArg(ca, idx, _, v, _),
+    TaintedVar(caller, v, v_def, _, _),
+    DefReachesUse(caller, v, v_def, ca).
+
+// ── Guard detection ────────────────────────────────────────────────
+// A sink is "guarded" if the tainted variable was bounds-checked.
+// Not full path sensitivity but useful for triage / false-positive reduction.
+
+.decl GuardedSink(caller: Sym, callee: Sym, call_addr: Addr,
+                  guard_var: Sym, guard_op: Sym, guard_bound: Sym)
+
+// Guard on a var that flows to the sink's tainted arg
+GuardedSink(caller, callee, ca, gv, op, bound) :-
+    TaintedSink(caller, callee, ca, _, tv, _, _),
+    TaintedVar(caller, tv, tv_def, _, _),
+    TaintedVar(caller, gv, gv_def, _, _),
+    DefReachesUse(caller, gv, gv_def, tv_def),
+    Guard(caller, _, gv, _, op, bound, _).
+
+// Direct guard on the tainted var itself
+GuardedSink(caller, callee, ca, tv, op, bound) :-
+    TaintedSink(caller, callee, ca, _, tv, _, _),
+    TaintedVar(caller, tv, tv_def, _, _),
+    Guard(caller, guard_addr, tv, _, op, bound, _),
+    DefReachesUse(caller, tv, tv_def, guard_addr).
+
+// ── Sink detection (sanitizer-aware) ───────────────────────────────
+
+.decl TaintedSink(caller: Sym, callee: Sym, call_addr: Addr,
+                  arg_idx: Idx, tainted_var: Sym, risk: Sym, origin: Sym)
+
+TaintedSink(caller, callee, ca, idx, v, risk, origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    !SanitizedVar(caller, v, v_def, _, _).
+
+// Address-of output param pattern: &var was passed to callee which tainted it,
+// now var flows to a dangerous sink. E.g., decode_index(ptr, &index); get_array(arr, index);
+TaintedSink(caller, callee, ca, idx, v, risk, origin) :-
+    TaintedVar(caller, av, av_def, origin, _),
+    av = cat("&", v),
+    DefReachesUse(caller, v, av_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    !SanitizedVar(caller, v, av_def, _, _).
+
+// Function-pointer indirection: hooks->allocate wraps malloc, etc.
+// Match callee names containing a known sink name (e.g., "hooks.allocate"
+// matches "allocate" → treat as alloc sink with same arg mapping).
+TaintedSink(caller, callee, ca, idx, v, "alloc", origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    (contains("allocate", callee) ; contains("malloc", callee)),
+    idx = 0,
+    !SanitizedVar(caller, v, v_def, _, _).
+
+TaintedSink(caller, callee, ca, idx, v, "uaf", origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    (contains("deallocate", callee) ; contains("free", callee)),
+    idx = 0,
+    !SanitizedVar(caller, v, v_def, _, _).
+
+TaintedSink(caller, callee, ca, idx, v, "overflow", origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    contains("reallocat", callee),
+    idx = 1,
+    !SanitizedVar(caller, v, v_def, _, _).
+
+// ── Rule 10: Taint-controlled reachability ─────────────────────────
+// Captures: attacker-controlled data determines whether a dangerous
+// operation executes, even if the sink's argument isn't directly tainted.
+//
+// Real-world pattern: guard may be arbitrarily many call levels above
+// the sink. E.g., dispatch_event checks tainted event_type (guard),
+// calls handle_process_event, which calls strcat (sink). The guard is
+// in the caller, not the function containing the sink.
+//
+// Approach: transitive "taint-guarded call reachability".
+//  1. TaintGuardedCall: a call site dominated by a tainted guard
+//  2. TaintReachableFunc: transitive closure through the call graph
+//  3. TaintControlledSink: any dangerous sink inside a taint-reachable func
+
+// Step 1: Direct — a call in func F is guarded by a tainted variable
+.decl TaintGuardedCall(func: Sym, callee: Sym, call_addr: Addr,
+                       guard_var: Sym, origin: Sym)
+
+TaintGuardedCall(f, callee, ca, gv, origin) :-
+    TaintedVar(f, gv, gv_def, origin, _),
+    DefReachesUse(f, gv, gv_def, ga),
+    Guard(f, ga, gv, _, _, _, _),
+    Call(f, callee, ca),
+    CFGReach(f, ga, ca).
+
+// Step 2: Transitive — if F is taint-reachable and F calls G, then G
+// is also taint-reachable (at any call depth).
+.decl TaintReachableFunc(func: Sym, guard_func: Sym, guard_var: Sym, origin: Sym)
+
+// Base: the direct callee of a taint-guarded call
+TaintReachableFunc(callee, f, gv, origin) :-
+    TaintGuardedCall(f, callee, _, gv, origin).
+
+// Recursive: anything called by a taint-reachable function
+TaintReachableFunc(callee, gf, gv, origin) :-
+    TaintReachableFunc(mid, gf, gv, origin),
+    Call(mid, callee, _).
+
+// Step 3: Any dangerous sink in a taint-reachable function is a
+// taint-controlled sink.
+.decl TaintControlledSink(caller: Sym, callee: Sym, call_addr: Addr,
+                          guard_addr: Addr, guard_var: Sym, risk: Sym, origin: Sym)
+
+// Intraprocedural: tainted guard and sink in the same function
+TaintControlledSink(f, callee, ca, ga, gv, risk, origin) :-
+    TaintedVar(f, gv, gv_def, origin, _),
+    DefReachesUse(f, gv, gv_def, ga),
+    Guard(f, ga, gv, _, _, _, _),
+    Call(f, callee, ca),
+    DangerousSink(callee, _, risk),
+    CFGReach(f, ga, ca),
+    !TaintedSink(f, callee, ca, _, _, _, _).
+
+// Interprocedural (transitive): sink is in a function reachable from
+// a taint-guarded call, at any depth in the call graph.
+TaintControlledSink(func, callee, ca, 0, gv, risk, origin) :-
+    TaintReachableFunc(func, _, gv, origin),
+    Call(func, callee, ca),
+    DangerousSink(callee, _, risk),
+    !TaintedSink(func, callee, ca, _, _, _, _).
+
+.output TaintGuardedCall
+.output TaintReachableFunc
+.output TaintControlledSink
+
+// ════════════════════════════════════════════════════════════════════
+// GLOBAL VARIABLE TAINT PROPAGATION
+// ════════════════════════════════════════════════════════════════════
+// Global variables are accessed across functions without being passed
+// as parameters. Infer globals heuristically: a variable used (or
+// defined) in multiple functions without being a formal parameter.
+
+.decl GlobalVar(var: Sym)
+GlobalVar(v) :-
+    Def(f1, v, _, _),
+    Def(f2, v, _, _),
+    f1 != f2,
+    !FormalParam(f1, v, _),
+    !FormalParam(f2, v, _).
+
+GlobalVar(v) :-
+    Use(f1, v, _, _),
+    Use(f2, v, _, _),
+    f1 != f2,
+    !FormalParam(f1, v, _),
+    !FormalParam(f2, v, _).
+
+// When any function taints a global variable, it becomes globally tainted.
+.decl TaintedGlobal(var: Sym, origin: Sym)
+TaintedGlobal(v, origin) :-
+    TaintedVar(_, v, _, origin, _),
+    GlobalVar(v).
+
+// Any function that uses a tainted global inherits the taint.
+TaintedVar(f, v, d, origin, 0) :-
+    TaintedGlobal(v, origin),
+    Def(f, v, _, d).
+
+.output GlobalVar
+.output TaintedGlobal
+
+// ── IsParam (convenience) ──────────────────────────────────────────
+.decl IsParam(func: Sym, var: Sym)
+IsParam(f, v) :- FormalParam(f, v, _).
+
+// ── Outputs ────────────────────────────────────────────────────────
+.output TaintedVar
+.output TaintedBuffer
+.output TaintedField
+.output TaintedHeapObject
+.output TaintedSink
+.output SanitizedVar
+.output GuardedSink
+.output IsParam
+.output DefReachesUse

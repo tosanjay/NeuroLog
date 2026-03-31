@@ -1,0 +1,10 @@
+.env
+CLAUDE.md
+.claude/
+__pycache__/
+*.pyc
+facts/
+output/
+eval/results/*/facts/
+eval/results/*/output/
+eval/results/*/output_debug/

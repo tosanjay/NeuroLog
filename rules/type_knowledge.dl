@@ -1,0 +1,201 @@
+// Type knowledge base — encodes C type semantics for source-level analysis.
+//
+// This is the key advantage over binary analysis: we KNOW the types.
+// Binary tools see "4-byte integer" but can't distinguish int from uint32_t.
+//
+// Covers: stdint.h, inttypes.h, POSIX types, common typedefs.
+// Platform: LP64 (Linux/macOS 64-bit) by default. Override by adding
+// platform-specific TypeInfo facts before including this file.
+//
+// Expects the including file to define: .type Sym, .type Addr, .type Ver
+// and .decl VarType(func: Sym, var: Sym, type_name: Sym, width: unsigned, signedness: Sym)
+
+// ════════════════════════════════════════════════════════════════════
+// TYPE KNOWLEDGE BASE
+// ════════════════════════════════════════════════════════════════════
+
+// TypeInfo(type_name, canonical_name, width_bytes, signedness)
+//   canonical_name: normalized form for equivalence (e.g., "uint32" for both uint32_t and "unsigned int")
+//   signedness: "signed", "unsigned", "pointer", "void", "struct"
+.decl TypeInfo(type_name: Sym, canonical: Sym, width: unsigned, signedness: Sym)
+
+// ── C fundamental types (LP64) ──────────────────────────────────────
+
+// char — signedness is implementation-defined, but usually signed on x86
+TypeInfo("char",             "char",     1, "signed").
+TypeInfo("signed char",      "int8",     1, "signed").
+TypeInfo("unsigned char",    "uint8",    1, "unsigned").
+
+TypeInfo("short",            "int16",    2, "signed").
+TypeInfo("short int",        "int16",    2, "signed").
+TypeInfo("signed short",     "int16",    2, "signed").
+TypeInfo("unsigned short",   "uint16",   2, "unsigned").
+
+TypeInfo("int",              "int32",    4, "signed").
+TypeInfo("signed int",       "int32",    4, "signed").
+TypeInfo("signed",           "int32",    4, "signed").
+TypeInfo("unsigned int",     "uint32",   4, "unsigned").
+TypeInfo("unsigned",         "uint32",   4, "unsigned").
+
+// LP64: long is 8 bytes on Linux/macOS, 4 on Windows (LLP64)
+TypeInfo("long",             "int64",    8, "signed").
+TypeInfo("long int",         "int64",    8, "signed").
+TypeInfo("signed long",      "int64",    8, "signed").
+TypeInfo("unsigned long",    "uint64",   8, "unsigned").
+
+TypeInfo("long long",        "int64",    8, "signed").
+TypeInfo("long long int",    "int64",    8, "signed").
+TypeInfo("unsigned long long", "uint64", 8, "unsigned").
+
+// ── stdint.h exact-width types ──────────────────────────────────────
+
+TypeInfo("int8_t",           "int8",     1, "signed").
+TypeInfo("uint8_t",          "uint8",    1, "unsigned").
+TypeInfo("int16_t",          "int16",    2, "signed").
+TypeInfo("uint16_t",         "uint16",   2, "unsigned").
+TypeInfo("int32_t",          "int32",    4, "signed").
+TypeInfo("uint32_t",         "uint32",   4, "unsigned").
+TypeInfo("int64_t",          "int64",    8, "signed").
+TypeInfo("uint64_t",         "uint64",   8, "unsigned").
+
+// ── stdint.h minimum-width types ────────────────────────────────────
+
+TypeInfo("int_least8_t",     "int8",     1, "signed").
+TypeInfo("uint_least8_t",    "uint8",    1, "unsigned").
+TypeInfo("int_least16_t",    "int16",    2, "signed").
+TypeInfo("uint_least16_t",   "uint16",   2, "unsigned").
+TypeInfo("int_least32_t",    "int32",    4, "signed").
+TypeInfo("uint_least32_t",   "uint32",   4, "unsigned").
+TypeInfo("int_least64_t",    "int64",    8, "signed").
+TypeInfo("uint_least64_t",   "uint64",   8, "unsigned").
+
+// ── stdint.h fast types ─────────────────────────────────────────────
+
+TypeInfo("int_fast8_t",      "int8",     1, "signed").
+TypeInfo("uint_fast8_t",     "uint8",    1, "unsigned").
+TypeInfo("int_fast16_t",     "int64",    8, "signed").
+TypeInfo("uint_fast16_t",    "uint64",   8, "unsigned").
+TypeInfo("int_fast32_t",     "int64",    8, "signed").
+TypeInfo("uint_fast32_t",    "uint64",   8, "unsigned").
+TypeInfo("int_fast64_t",     "int64",    8, "signed").
+TypeInfo("uint_fast64_t",    "uint64",   8, "unsigned").
+
+// ── stdint.h pointer-width types ────────────────────────────────────
+
+TypeInfo("intptr_t",         "intptr",   8, "signed").
+TypeInfo("uintptr_t",        "uintptr",  8, "unsigned").
+TypeInfo("intmax_t",         "int64",    8, "signed").
+TypeInfo("uintmax_t",        "uint64",   8, "unsigned").
+
+// ── POSIX / common types ────────────────────────────────────────────
+
+TypeInfo("size_t",           "size_t",   8, "unsigned").
+TypeInfo("ssize_t",          "ssize_t",  8, "signed").
+TypeInfo("ptrdiff_t",        "ptrdiff",  8, "signed").
+TypeInfo("off_t",            "off_t",    8, "signed").
+TypeInfo("pid_t",            "pid_t",    4, "signed").
+TypeInfo("uid_t",            "uid_t",    4, "unsigned").
+TypeInfo("gid_t",            "gid_t",    4, "unsigned").
+TypeInfo("mode_t",           "mode_t",   4, "unsigned").
+TypeInfo("socklen_t",        "socklen",  4, "unsigned").
+TypeInfo("time_t",           "time_t",   8, "signed").
+
+// ── Boolean ─────────────────────────────────────────────────────────
+
+TypeInfo("bool",             "bool",     1, "unsigned").
+TypeInfo("_Bool",            "bool",     1, "unsigned").
+
+// ── Floating point ──────────────────────────────────────────────────
+
+TypeInfo("float",            "float",    4, "signed").
+TypeInfo("double",           "double",   8, "signed").
+TypeInfo("long double",      "ldouble",  16, "signed").
+
+// ── void ────────────────────────────────────────────────────────────
+
+TypeInfo("void",             "void",     0, "void").
+
+// ════════════════════════════════════════════════════════════════════
+// DERIVED RELATIONS
+// ════════════════════════════════════════════════════════════════════
+
+// Signed-unsigned counterparts (same canonical width, different sign)
+.decl SignedCounterpart(signed_type: Sym, unsigned_type: Sym, width: unsigned)
+SignedCounterpart(st, ut, w) :-
+    TypeInfo(st, _, w, "signed"),
+    TypeInfo(ut, _, w, "unsigned"),
+    w > 0.
+
+// Type equivalence — same canonical form
+.decl TypeEquiv(type1: Sym, type2: Sym)
+TypeEquiv(t1, t2) :-
+    TypeInfo(t1, c, _, _),
+    TypeInfo(t2, c, _, _),
+    t1 != t2.
+
+// Widening conversion (safe direction, but may lose sign info)
+.decl WidensTo(narrow: Sym, wide: Sym)
+WidensTo(n, w) :-
+    TypeInfo(n, _, nw, _),
+    TypeInfo(w, _, ww, _),
+    nw < ww, nw > 0.
+
+// Narrowing conversion (dangerous — data loss possible)
+.decl NarrowsTo(wide: Sym, narrow: Sym)
+NarrowsTo(w, n) :-
+    TypeInfo(w, _, ww, _),
+    TypeInfo(n, _, nw, _),
+    ww > nw, nw > 0.
+
+// ════════════════════════════════════════════════════════════════════
+// VARTYPE VALIDATION — check LLM-extracted types against knowledge base
+// ════════════════════════════════════════════════════════════════════
+// Input: VarType facts from LLM extraction
+// Output: validated types with canonical info, or warnings for unknowns
+
+// VarType is declared and .input'd by the including file.
+
+// Resolved: VarType with knowledge-base-validated properties
+// If TypeInfo has the type, use its canonical width/signedness.
+// Otherwise, trust the LLM's extraction.
+.decl ResolvedVarType(func: Sym, var: Sym, type_name: Sym,
+                      canonical: Sym, width: unsigned, signedness: Sym)
+
+// Known type: override LLM width/signedness with ground truth
+ResolvedVarType(f, v, tn, c, w, s) :-
+    VarType(f, v, tn, _, _),
+    TypeInfo(tn, c, w, s).
+
+// Unknown type: trust LLM extraction (canonical = type_name)
+ResolvedVarType(f, v, tn, tn, w, s) :-
+    VarType(f, v, tn, w, s),
+    !TypeInfo(tn, _, _, _).
+
+// Pointer types: match "X*" pattern — always 8 bytes, "pointer" signedness
+// (Souffle doesn't have regex, so we rely on LLM setting signedness="pointer")
+ResolvedVarType(f, v, tn, "pointer", 8, "pointer") :-
+    VarType(f, v, tn, _, "pointer").
+
+.output ResolvedVarType
+
+// Types the LLM extracted but we don't recognize
+.decl UnknownType(func: Sym, var: Sym, type_name: Sym)
+UnknownType(f, v, tn) :-
+    VarType(f, v, tn, _, s),
+    !TypeInfo(tn, _, _, _),
+    s != "pointer",
+    s != "struct".
+
+.output UnknownType
+
+// Width/signedness mismatch between LLM and knowledge base
+.decl TypeInfoMismatch(func: Sym, var: Sym, type_name: Sym,
+                       llm_width: unsigned, kb_width: unsigned,
+                       llm_sign: Sym, kb_sign: Sym)
+
+TypeInfoMismatch(f, v, tn, lw, kw, ls, ks) :-
+    VarType(f, v, tn, lw, ls),
+    TypeInfo(tn, _, kw, ks),
+    (lw != kw ; ls != ks).
+
+.output TypeInfoMismatch

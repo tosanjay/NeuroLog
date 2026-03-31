@@ -1,0 +1,232 @@
+// source_taint.dl — Intraprocedural taint analysis for source code
+//
+// Uses reaching definitions (via CFGEdge) to gate taint propagation.
+// Taint only flows from a def to a use if the def actually REACHES that use
+// through the CFG — sanitization (redefinition) correctly kills taint.
+//
+// Self-contained: includes reaching-definitions rules inline.
+
+// ── Types ──────────────────────────────────────────────────────────
+.type Addr <: unsigned
+.type Sym  <: symbol
+.type Ver  <: unsigned
+.type Idx  <: unsigned
+
+// ── Input relations ────────────────────────────────────────────────
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+
+.decl ReturnVal(func: Sym, var: Sym, ver: Ver)
+.input ReturnVal
+
+.decl CFGEdge(func: Sym, from_addr: Addr, to_addr: Addr)
+.input CFGEdge
+
+.decl AddressOf(func: Sym, var: Sym, ver: Ver, target: Sym)
+.input AddressOf
+
+.decl FieldRead(func: Sym, addr: Addr, base: Sym, field: Sym)
+.input FieldRead
+
+.decl FieldWrite(func: Sym, addr: Addr, base: Sym, field: Sym, mem_in: Ver, mem_out: Ver)
+.input FieldWrite
+
+.decl MemRead(func: Sym, addr: Addr, base: Sym, offset: Sym, size: Sym)
+.input MemRead
+
+.decl MemWrite(func: Sym, addr: Addr, target: Sym, mem_in: Ver, mem_out: Ver)
+.input MemWrite
+
+.decl FormalParam(func: Sym, var: Sym, idx: Idx)
+.input FormalParam
+
+.decl PhiSource(func: Sym, var: Sym, def_ver: Ver, src_var: Sym, src_ver: Ver)
+.input PhiSource
+
+.decl Guard(func: Sym, addr: Addr, var: Sym, ver: Ver, op: Sym, bound: Sym, bound_type: Sym)
+.input Guard
+
+// ── CFG Reachability ───────────────────────────────────────────────
+.decl CFGReach(func: Sym, from_addr: Addr, to_addr: Addr)
+CFGReach(f, a, b) :- CFGEdge(f, a, b).
+CFGReach(f, a, c) :- CFGReach(f, a, b), CFGEdge(f, b, c).
+
+// ── Defensive Def inference (source code adaptation) ──────────────
+// Infer Def for output params of taint source functions.
+Def(caller, v, 0, ca) :-
+    Call(caller, callee, ca),
+    TaintSourceFunc(callee),
+    ActualArg(ca, _, _, v, _).
+
+// ── Reaching Definitions (from source_core.dl, inlined) ────────────
+
+.decl Kills(func: Sym, var: Sym, node: Addr)
+Kills(f, v, n) :- Def(f, v, _, n).
+
+.decl ReachesIn(func: Sym, var: Sym, def_line: Addr, node: Addr)
+ReachesIn(f, v, d, n) :-
+    ReachesOut(f, v, d, pred),
+    CFGEdge(f, pred, n).
+
+.decl ReachesOut(func: Sym, var: Sym, def_line: Addr, node: Addr)
+ReachesOut(f, v, d, d) :- Def(f, v, _, d).
+ReachesOut(f, v, d, n) :-
+    ReachesIn(f, v, d, n),
+    !Kills(f, v, n).
+
+.decl DefReachesUse(func: Sym, var: Sym, def_line: Addr, use_line: Addr)
+DefReachesUse(f, v, d, u) :-
+    ReachesIn(f, v, d, u),
+    Use(f, v, _, u).
+
+// ── Taint sources and sinks ────────────────────────────────────────
+
+.decl TaintSourceFunc(name: Sym)
+TaintSourceFunc("read").
+TaintSourceFunc("recv").
+TaintSourceFunc("fread").
+TaintSourceFunc("fgets").
+TaintSourceFunc("getenv").
+TaintSourceFunc("scanf").
+TaintSourceFunc("fscanf").
+TaintSourceFunc("getline").
+TaintSourceFunc("fgetc").
+TaintSourceFunc("getchar").
+TaintSourceFunc("gets").
+
+.decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
+DangerousSink("memcpy",  2, "buffer_overflow").
+DangerousSink("memcpy",  1, "buffer_overflow").
+DangerousSink("memmove", 2, "buffer_overflow").
+DangerousSink("memset",  2, "buffer_overflow").
+DangerousSink("strcpy",  1, "buffer_overflow").
+DangerousSink("strncpy", 2, "buffer_overflow").
+DangerousSink("sprintf", 1, "format_string").
+DangerousSink("snprintf",2, "format_string").
+DangerousSink("system",  0, "command_injection").
+DangerousSink("free",    0, "double_free").
+DangerousSink("strcat",  1, "buffer_overflow").
+DangerousSink("strncat", 1, "buffer_overflow").
+DangerousSink("printf",  0, "format_string").
+DangerousSink("fprintf", 1, "format_string").
+DangerousSink("malloc",  0, "heap_overflow").
+DangerousSink("calloc",  0, "heap_overflow").
+DangerousSink("calloc",  1, "heap_overflow").
+DangerousSink("realloc", 1, "heap_overflow").
+
+// ── Taint propagation ──────────────────────────────────────────────
+// TaintVar(func, var, def_line, reason)
+//   def_line: the line where this tainted definition originates
+//   reason:   human-readable taint origin description
+
+.decl TaintVar(func: Sym, var: Sym, def_line: Addr, reason: Sym)
+
+// Rule 1: Arguments passed to taint source functions become tainted.
+// The call site line is the taint origin.
+TaintVar(caller, v, ca, cat("arg_to_", callee)) :-
+    Call(caller, callee, ca),
+    TaintSourceFunc(callee),
+    ActualArg(ca, _, _, v, _).
+
+// Rule 2: Return values from taint source functions are tainted.
+TaintVar(caller, v, ca, cat("ret_from_", callee)) :-
+    Call(caller, callee, ca),
+    TaintSourceFunc(callee),
+    Def(caller, v, _, ca).
+
+// Rule 3: Assignment propagation gated by reaching definitions.
+// If tainted src (defined at src_def) reaches a use at addr, and dst
+// is defined at addr, then dst becomes tainted (at addr).
+TaintVar(f, dst, addr, reason) :-
+    TaintVar(f, src, src_def, reason),
+    DefReachesUse(f, src, src_def, addr),
+    Def(f, dst, _, addr),
+    dst != src.
+
+// Rule 3b: Self-assignment (x++, x += n, x = x + 1).
+// Taint carries through when a variable is redefined from itself.
+TaintVar(f, v, addr, reason) :-
+    TaintVar(f, v, v_def, reason),
+    DefReachesUse(f, v, v_def, addr),
+    Def(f, v, _, addr),
+    addr != v_def.
+
+// Rule 4: Pointer-to-buffer propagation.
+.decl TaintedBuffer(func: Sym, buffer: Sym, reason: Sym)
+
+// If var holds &buf and var is tainted, then buf is tainted.
+TaintedBuffer(f, target, reason) :-
+    TaintVar(f, v, v_def, reason),
+    AddressOf(f, v, _, target),
+    Def(f, v, _, v_def).
+
+// Reading from a tainted buffer taints the destination.
+TaintVar(f, dv, addr, reason) :-
+    TaintedBuffer(f, buf, reason),
+    MemRead(f, addr, buf, _, _),
+    Def(f, dv, _, addr).
+
+// Rule 5: Field taint propagation.
+.decl TaintedField(func: Sym, base: Sym, field: Sym, reason: Sym)
+
+// Writing tainted data to a struct field taints that field.
+TaintedField(f, base, field, reason) :-
+    TaintVar(f, v, v_def, reason),
+    DefReachesUse(f, v, v_def, addr),
+    FieldWrite(f, addr, base, field, _, _).
+
+// Reading a tainted field taints the destination variable.
+TaintVar(f, dv, addr, reason) :-
+    TaintedField(f, base, field, reason),
+    FieldRead(f, addr, base, field),
+    Def(f, dv, _, addr).
+
+// ── Sink detection ─────────────────────────────────────────────────
+.decl TaintedSink(caller: Sym, callee: Sym, call_addr: Addr, arg_idx: Idx,
+                  tainted_var: Sym, risk: Sym, reason: Sym)
+
+// A sink is reached if the tainted def actually reaches the call site.
+TaintedSink(caller, callee, ca, idx, v, risk, reason) :-
+    TaintVar(caller, v, v_def, reason),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk).
+
+// ── Taint-controlled reachability ───────────────────────────────────
+// Sink's argument isn't directly tainted, but a tainted var controls
+// whether the sink executes (via branch guard).
+.decl TaintControlledSink(caller: Sym, callee: Sym, call_addr: Addr,
+                          guard_addr: Addr, guard_var: Sym, risk: Sym, reason: Sym)
+
+TaintControlledSink(caller, callee, ca, ga, gv, risk, reason) :-
+    TaintVar(caller, gv, gv_def, reason),
+    DefReachesUse(caller, gv, gv_def, ga),
+    Guard(caller, ga, gv, _, _, _, _),
+    Call(caller, callee, ca),
+    DangerousSink(callee, _, risk),
+    CFGReach(caller, ga, ca),
+    !TaintedSink(caller, callee, ca, _, _, _, _).
+
+.output TaintControlledSink
+
+// ── Outputs ────────────────────────────────────────────────────────
+.output TaintVar
+.output TaintedBuffer
+.output TaintedField
+.output TaintedSink
+.output DefReachesUse
+
+// Debug: taint summary per function
+.decl TaintSummary(func: Sym, var: Sym, def_line: Addr, reason: Sym)
+TaintSummary(f, v, d, r) :- TaintVar(f, v, d, r).
+.output TaintSummary

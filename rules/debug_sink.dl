@@ -1,0 +1,66 @@
+// Debug TaintedSink join for get_array_item
+
+// ── Input Relations (same as source_interproc.dl) ──
+.decl Def(f:symbol,v:symbol,ver:number,addr:number) .input Def
+.decl Use(f:symbol,v:symbol,ver:number,addr:number) .input Use
+.decl Call(caller:symbol,callee:symbol,addr:number) .input Call
+.decl FormalParam(f:symbol,v:symbol,idx:number) .input FormalParam
+.decl ActualArg(ca:number,idx:number,name:symbol,expr:symbol,indirect:number) .input ActualArg
+.decl DangerousSink(f:symbol,idx:number,risk:symbol) .input DangerousSink
+.decl TaintedVar(f:symbol,v:symbol,d:number,o:symbol,c:number) .input TaintedVar
+.decl DefReachesUse(f:symbol,v:symbol,d:number,u:number) .input DefReachesUse
+.decl SanitizedVar(f:symbol,v:symbol,d:number,s:number,g:symbol) .input SanitizedVar
+.decl GuardedSink(callerF:symbol,callee:symbol,ca:number,gv:symbol,op:symbol,val:symbol) .input GuardedSink
+
+// Check 1: TaintedVar for index
+.decl DbgTV(f:symbol, v:symbol, d:number, o:symbol, c:number)
+.output DbgTV
+DbgTV(f,v,d,o,c) :- TaintedVar(f,v,d,o,c), f="get_item_from_pointer", v="index".
+
+// Check 2: DefReachesUse for index→22
+.decl DbgDRU(f:symbol, v:symbol, d:number, u:number)
+.output DbgDRU
+DbgDRU(f,v,d,u) :- DefReachesUse(f,v,d,u), f="get_item_from_pointer", v="index", u=22.
+
+// Check 3: Call at 22
+.decl DbgCall(caller:symbol, callee:symbol, ca:number)
+.output DbgCall
+DbgCall(caller,callee,ca) :- Call(caller,callee,ca), caller="get_item_from_pointer", ca=22.
+
+// Check 4: ActualArg at 22
+.decl DbgAA(ca:number, idx:number, n:symbol, expr:symbol, ind:number)
+.output DbgAA
+DbgAA(ca,idx,n,expr,ind) :- ActualArg(ca,idx,n,expr,ind), ca=22.
+
+// Check 5: DangerousSink for get_array_item
+.decl DbgDS(f:symbol, idx:number, risk:symbol)
+.output DbgDS
+DbgDS(f,idx,risk) :- DangerousSink(f,idx,risk), f="get_array_item".
+
+// Check 6: SanitizedVar for get_item_from_pointer
+.decl DbgSV(f:symbol, v:symbol, d:number, s:number, g:symbol)
+.output DbgSV
+DbgSV(f,v,d,s,g) :- SanitizedVar(f,v,d,s,g), f="get_item_from_pointer".
+
+// Check 7: Full join WITHOUT negation
+.decl DbgJoin(caller:symbol, callee:symbol, ca:number, idx:number, v:symbol, risk:symbol, origin:symbol)
+.output DbgJoin
+DbgJoin(caller, callee, ca, idx, v, risk, origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    caller = "get_item_from_pointer".
+
+// Check 8: Full join WITH negation (same as production rule)
+.decl DbgJoinNeg(caller:symbol, callee:symbol, ca:number, idx:number, v:symbol, risk:symbol, origin:symbol)
+.output DbgJoinNeg
+DbgJoinNeg(caller, callee, ca, idx, v, risk, origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    !SanitizedVar(caller, v, v_def, _, _),
+    caller = "get_item_from_pointer".

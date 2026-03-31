@@ -1,0 +1,65 @@
+// Post-pass: compute TaintedSink from recycled facts
+// This runs after source_interproc.dl to catch sinks that the
+// fixpoint computation misses due to Souffle evaluation ordering.
+
+.type Sym <: symbol
+.type Addr <: number
+.type Idx <: number
+
+.decl TaintedVar(f:Sym, v:Sym, def_addr:Addr, origin:Sym, ctx:Addr) .input TaintedVar
+.decl DefReachesUse(f:Sym, v:Sym, def_addr:Addr, use_addr:Addr) .input DefReachesUse
+.decl Call(caller:Sym, callee:Sym, addr:Addr) .input Call
+.decl ActualArg(ca:Addr, idx:Idx, name:Sym, expr:Sym, indirect:Idx) .input ActualArg
+.decl DangerousSink(f:Sym, idx:Idx, risk:Sym) .input DangerousSink
+.decl SanitizedVar(f:Sym, v:Sym, def_addr:Addr, sanitize_addr:Addr, guard:Sym) .input SanitizedVar
+.decl GuardedSink(callerF:Sym, callee:Sym, ca:Addr, gv:Sym, op:Sym, val:Sym) .input GuardedSink
+
+// ── TaintedSink (main rule) ──
+.decl TaintedSink(caller:Sym, callee:Sym, call_addr:Addr,
+                  arg_idx:Idx, tainted_var:Sym, risk:Sym, origin:Sym)
+.output TaintedSink
+
+TaintedSink(caller, callee, ca, idx, v, risk, origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    !SanitizedVar(caller, v, v_def, _, _).
+
+// Address-of output param pattern
+TaintedSink(caller, callee, ca, idx, v, risk, origin) :-
+    TaintedVar(caller, av, av_def, origin, _),
+    av = cat("&", v),
+    DefReachesUse(caller, v, av_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    !SanitizedVar(caller, v, av_def, _, _).
+
+// Function-pointer indirection
+TaintedSink(caller, callee, ca, idx, v, "alloc", origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    (contains("allocate", callee) ; contains("malloc", callee)),
+    idx = 0,
+    !SanitizedVar(caller, v, v_def, _, _).
+
+TaintedSink(caller, callee, ca, idx, v, "uaf", origin) :-
+    TaintedVar(caller, v, v_def, origin, _),
+    DefReachesUse(caller, v, v_def, ca),
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    (contains("deallocate", callee) ; contains("free", callee)),
+    idx = 0,
+    !SanitizedVar(caller, v, v_def, _, _).
+
+// ── UnguardedTaintedSink ──
+.decl UnguardedTaintedSink(f:Sym, callee:Sym, ca:Addr, idx:Idx, v:Sym, risk:Sym, origin:Sym)
+.output UnguardedTaintedSink
+
+UnguardedTaintedSink(f, callee, ca, idx, v, risk, origin) :-
+    TaintedSink(f, callee, ca, idx, v, risk, origin),
+    !GuardedSink(f, callee, ca, _, _, _).

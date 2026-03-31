@@ -1,0 +1,116 @@
+// source_core.dl — Core rules for source-level Datalog analysis
+//
+// Replaces SSA-based def-use (from bin_datalog) with CFGEdge-based
+// reaching definitions.  Key change: (var, def_line) pairs replace
+// (var, ver) as unique definition identifiers.
+//
+// Requires CFGEdge facts — without them, only same-line def-use works.
+
+// ── Type declarations ──────────────────────────────────────────────
+.type Addr <: unsigned      // source line number
+.type Sym  <: symbol
+.type Ver  <: unsigned      // always 0 for source code (schema compat)
+.type Idx  <: unsigned
+
+// ── Input relations ────────────────────────────────────────────────
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+
+.decl ReturnVal(func: Sym, var: Sym, ver: Ver)
+.input ReturnVal
+
+.decl CFGEdge(func: Sym, from_addr: Addr, to_addr: Addr)
+.input CFGEdge
+
+.decl AddressOf(func: Sym, var: Sym, ver: Ver, target: Sym)
+.input AddressOf
+
+.decl FieldRead(func: Sym, addr: Addr, base: Sym, field: Sym)
+.input FieldRead
+
+.decl FieldWrite(func: Sym, addr: Addr, base: Sym, field: Sym, mem_in: Ver, mem_out: Ver)
+.input FieldWrite
+
+.decl FormalParam(func: Sym, var: Sym, idx: Idx)
+.input FormalParam
+
+// PhiSource — declared for schema compat, unused (reaching defs subsumes phi)
+.decl PhiSource(func: Sym, var: Sym, def_ver: Ver, src_var: Sym, src_ver: Ver)
+.input PhiSource
+
+// ── CFG Reachability (transitive closure) ──────────────────────────
+.decl CFGReach(func: Sym, from_addr: Addr, to_addr: Addr)
+CFGReach(f, a, b) :- CFGEdge(f, a, b).
+CFGReach(f, a, c) :- CFGReach(f, a, b), CFGEdge(f, b, c).
+
+.output CFGReach
+
+// ── Reaching Definitions ───────────────────────────────────────────
+// Standard Gen-Kill dataflow via stratified negation.
+//
+// Stratification:  Kills depends only on Def (stratum 0).
+//                  ReachesIn/ReachesOut form a positive cycle (stratum 1)
+//                  with negation only on Kills (stratum 0).  Valid.
+
+// A node kills all incoming defs of var if it (re)defines that var.
+.decl Kills(func: Sym, var: Sym, node: Addr)
+Kills(f, v, n) :- Def(f, v, _, n).
+
+// A def reaches the ENTRY of a node (before the node's own def/use).
+.decl ReachesIn(func: Sym, var: Sym, def_line: Addr, node: Addr)
+ReachesIn(f, v, d, n) :-
+    ReachesOut(f, v, d, pred),
+    CFGEdge(f, pred, n).
+
+// A def reaches the EXIT of a node.
+.decl ReachesOut(func: Sym, var: Sym, def_line: Addr, node: Addr)
+
+// Gen: a definition at line d always reaches the exit of d.
+ReachesOut(f, v, d, d) :- Def(f, v, _, d).
+
+// Propagate: an incoming def survives if the node does NOT redefine var.
+ReachesOut(f, v, d, n) :-
+    ReachesIn(f, v, d, n),
+    !Kills(f, v, n).
+
+// ── Def-Use Pairs (reaching-definition aware) ──────────────────────
+// A def at def_line reaches the use at use_line.
+// Uses ReachesIn (entry), so for `x = x + 1`, the RHS use sees the
+// incoming def, while the LHS def kills it for subsequent nodes.
+.decl DefReachesUse(func: Sym, var: Sym, def_line: Addr, use_line: Addr)
+DefReachesUse(f, v, d, u) :-
+    ReachesIn(f, v, d, u),
+    Use(f, v, _, u).
+
+.output DefReachesUse
+
+// ── Call Reachability (transitive) ─────────────────────────────────
+.decl Reaches(caller: Sym, callee: Sym)
+Reaches(a, b) :- Call(a, b, _).
+Reaches(a, c) :- Reaches(a, b), Call(b, c, _).
+
+.output Reaches
+
+// ── Field Access Summary ───────────────────────────────────────────
+.decl FieldAccess(func: Sym, addr: Addr, base: Sym, field: Sym, kind: Sym)
+FieldAccess(f, a, b, fld, "read")  :- FieldRead(f, a, b, fld).
+FieldAccess(f, a, b, fld, "write") :- FieldWrite(f, a, b, fld, _, _).
+
+.output FieldAccess
+
+// ── Who calls whom with what args ──────────────────────────────────
+.decl CallWithArg(caller: Sym, callee: Sym, call_addr: Addr, arg_idx: Idx, var: Sym)
+CallWithArg(caller, callee, ca, idx, v) :-
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _).
+
+.output CallWithArg

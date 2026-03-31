@@ -1,0 +1,383 @@
+// Source-level type safety rules — signed/unsigned confusion, truncation,
+// width mismatch at dangerous sinks, signedness mismatch, and tainted cast chains.
+//
+// Consumes: Cast, VarType, Def, Use, Call, ActualArg, Guard, CFGEdge,
+//           TaintedVar, DefReachesUse (from source_interproc output).
+//
+// Key insight: source code gives us full type names (uint32_t, ssize_t, char*),
+// not just byte widths. This enables rules that binary analysis cannot express:
+// signed→unsigned assignment without cast, pointer-to-integer confusion, etc.
+
+// ════════════════════════════════════════════════════════════════════
+// TYPE DECLARATIONS
+// ════════════════════════════════════════════════════════════════════
+
+.type Sym   <: symbol
+.type Addr  <: unsigned
+.type Ver   <: unsigned
+.type Idx   <: unsigned
+
+// ════════════════════════════════════════════════════════════════════
+// INPUT RELATIONS
+// ════════════════════════════════════════════════════════════════════
+
+// Cast: now includes src_type and dst_type from source code
+.decl Cast(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+           src: Sym, src_ver: Ver, kind: Sym, src_width: unsigned,
+           dst_width: unsigned, src_type: Sym, dst_type: Sym)
+.input Cast
+
+// VarType: source-level type info from LLM extraction
+.decl VarType(func: Sym, var: Sym, type_name: Sym,
+              width: unsigned, signedness: Sym)
+.input VarType
+
+// Include type knowledge base (TypeInfo, ResolvedVarType, validation)
+#include "type_knowledge.dl"
+
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+
+.decl Guard(func: Sym, addr: Addr, var: Sym, ver: Ver,
+            op: Sym, bound: Sym, bound_type: Sym)
+.input Guard
+
+.decl CFGEdge(func: Sym, from_addr: Addr, to_addr: Addr)
+.input CFGEdge
+
+// Derived facts from source_interproc (recycled to facts/)
+.decl TaintedVar(func: Sym, var: Sym, def_line: Addr, origin: Sym, ctx: Addr)
+.input TaintedVar
+
+.decl DefReachesUse(func: Sym, var: Sym, def_line: Addr, use_line: Addr)
+.input DefReachesUse
+
+.decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
+DangerousSink("memcpy",  2, "buffer_overflow").
+DangerousSink("memcpy",  1, "buffer_overflow").
+DangerousSink("memmove", 2, "buffer_overflow").
+DangerousSink("memset",  2, "buffer_overflow").
+DangerousSink("strcpy",  1, "buffer_overflow").
+DangerousSink("strncpy", 2, "buffer_overflow").
+DangerousSink("sprintf", 2, "format_string").
+DangerousSink("malloc",  0, "allocation_size").
+DangerousSink("calloc",  0, "allocation_size").
+DangerousSink("realloc", 1, "allocation_size").
+DangerousSink("alloca",  0, "allocation_size").
+
+// ArithOp schema: func, addr, dst, dst_ver, op, src, src_ver, operand
+.decl ArithOp(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+              op: Sym, src: Sym, src_ver: Ver, operand: Sym)
+.input ArithOp
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 1: TRUNCATION — data loss when narrowing a value
+// ════════════════════════════════════════════════════════════════════
+
+.decl TruncationCast(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                     src_width: unsigned, dst_width: unsigned,
+                     src_type: Sym, dst_type: Sym)
+
+TruncationCast(f, a, src, dst, sw, dw, st, dt) :-
+    Cast(f, a, dst, _, src, _, "truncate", sw, dw, st, dt),
+    sw > dw.
+
+// Implicit narrowing the programmer may not have intended
+TruncationCast(f, a, src, dst, sw, dw, st, dt) :-
+    Cast(f, a, dst, _, src, _, "implicit", sw, dw, st, dt),
+    sw > dw.
+
+.output TruncationCast
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 2: SIGN CONFUSION — signed/unsigned mismatch
+// ════════════════════════════════════════════════════════════════════
+
+.decl SignConfusionCast(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                        kind: Sym, src_type: Sym, dst_type: Sym)
+
+// sign_extend: signed value widened — negative becomes huge unsigned
+SignConfusionCast(f, a, src, dst, "sign_extend", st, dt) :-
+    Cast(f, a, dst, _, src, _, "sign_extend", _, _, st, dt).
+
+// reinterpret between different widths — type punning
+SignConfusionCast(f, a, src, dst, "reinterpret", st, dt) :-
+    Cast(f, a, dst, _, src, _, "reinterpret", sw, dw, st, dt),
+    sw != dw.
+
+.output SignConfusionCast
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 2b: SIGNEDNESS MISMATCH — signed assigned to unsigned or vice versa
+// ════════════════════════════════════════════════════════════════════
+// Uses VarType signedness to detect assignments where a signed variable
+// flows into an unsigned one (or vice versa) WITHOUT an explicit cast.
+// This is strictly a source-code analysis — binary tools can't do this
+// because MLIL strips signedness.
+
+.decl SignednessMismatch(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                         src_sign: Sym, dst_sign: Sym,
+                         src_type: Sym, dst_type: Sym)
+
+// signed → unsigned assignment (e.g., int → size_t)
+SignednessMismatch(f, a, src, dst, "signed", "unsigned", st, dt) :-
+    Def(f, dst, _, a),
+    Use(f, src, _, a),
+    src != dst,
+    ResolvedVarType(f, src, st, _, _, "signed"),
+    ResolvedVarType(f, dst, dt, _, _, "unsigned").
+
+// unsigned → signed (less dangerous but can cause negative values)
+SignednessMismatch(f, a, src, dst, "unsigned", "signed", st, dt) :-
+    Def(f, dst, _, a),
+    Use(f, src, _, a),
+    src != dst,
+    ResolvedVarType(f, src, st, _, _, "unsigned"),
+    ResolvedVarType(f, dst, dt, _, _, "signed").
+
+// pointer → integer (type confusion, e.g., (int)ptr)
+SignednessMismatch(f, a, src, dst, "pointer", ss, st, dt) :-
+    Def(f, dst, _, a),
+    Use(f, src, _, a),
+    src != dst,
+    ResolvedVarType(f, src, st, _, _, "pointer"),
+    ResolvedVarType(f, dst, dt, _, _, ss),
+    ss != "pointer",
+    ss != "struct".
+
+.output SignednessMismatch
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 3: TAINTED TRUNCATION — attacker controls truncated value
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintedTruncation(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                        src_width: unsigned, dst_width: unsigned,
+                        src_type: Sym, dst_type: Sym, origin: Sym)
+
+TaintedTruncation(f, a, src, dst, sw, dw, st, dt, origin) :-
+    TruncationCast(f, a, src, dst, sw, dw, st, dt),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, a).
+
+.output TaintedTruncation
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 4: TAINTED SIGN EXTENSION — attacker controls sign-extended value
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintedSignExtension(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                           src_type: Sym, dst_type: Sym, origin: Sym)
+
+TaintedSignExtension(f, a, src, dst, st, dt, origin) :-
+    SignConfusionCast(f, a, src, dst, "sign_extend", st, dt),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, a).
+
+.output TaintedSignExtension
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 4b: TAINTED SIGNEDNESS MISMATCH — attacker value changes sign
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintedSignednessMismatch(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                                src_type: Sym, dst_type: Sym, origin: Sym)
+
+TaintedSignednessMismatch(f, a, src, dst, st, dt, origin) :-
+    SignednessMismatch(f, a, src, dst, _, _, st, dt),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, a).
+
+.output TaintedSignednessMismatch
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 5: WIDTH MISMATCH AT SINK — wrong-sized value at dangerous call
+// ════════════════════════════════════════════════════════════════════
+
+.decl WidthMismatchAtSink(func: Sym, call_addr: Addr, callee: Sym,
+                          var: Sym, cast_addr: Addr,
+                          src_width: unsigned, dst_width: unsigned, risk: Sym)
+
+WidthMismatchAtSink(f, ca, callee, dst, cast_a, sw, dw, risk) :-
+    TruncationCast(f, cast_a, _, dst, sw, dw, _, _),
+    Def(f, dst, _, cast_a),
+    DefReachesUse(f, dst, cast_a, ca),
+    Call(f, callee, ca),
+    ActualArg(ca, idx, _, dst, _),
+    DangerousSink(callee, idx, risk).
+
+.output WidthMismatchAtSink
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 5b: SIGNEDNESS MISMATCH AT SINK — signed value used as size
+// ════════════════════════════════════════════════════════════════════
+// E.g., negative int passed as malloc size → huge allocation.
+
+.decl SignedArgAtSink(func: Sym, call_addr: Addr, callee: Sym,
+                      var: Sym, type_name: Sym, risk: Sym)
+
+SignedArgAtSink(f, ca, callee, v, tn, risk) :-
+    Call(f, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    DangerousSink(callee, idx, risk),
+    ResolvedVarType(f, v, tn, _, _, "signed").
+
+.output SignedArgAtSink
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 6: TAINTED WIDTH MISMATCH AT SINK — exploitable
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintedWidthMismatchAtSink(func: Sym, call_addr: Addr, callee: Sym,
+                                 var: Sym, src_width: unsigned, dst_width: unsigned,
+                                 risk: Sym, origin: Sym)
+
+TaintedWidthMismatchAtSink(f, ca, callee, dst, sw, dw, risk, origin) :-
+    WidthMismatchAtSink(f, ca, callee, dst, cast_a, sw, dw, risk),
+    TaintedVar(f, dst, cast_a, origin, _).
+
+// Tainted source was cast, even if dst has a different name
+TaintedWidthMismatchAtSink(f, ca, callee, dst, sw, dw, risk, origin) :-
+    Cast(f, cast_a, dst, _, src, _, _, sw, dw, _, _),
+    sw != dw,
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, cast_a),
+    Def(f, dst, _, cast_a),
+    DefReachesUse(f, dst, cast_a, ca),
+    Call(f, callee, ca),
+    ActualArg(ca, idx, _, dst, _),
+    DangerousSink(callee, idx, risk).
+
+.output TaintedWidthMismatchAtSink
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 6b: TAINTED SIGNED VALUE AT SINK — signed tainted value as size
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintedSignedAtSink(func: Sym, call_addr: Addr, callee: Sym,
+                          var: Sym, type_name: Sym, risk: Sym, origin: Sym)
+
+TaintedSignedAtSink(f, ca, callee, v, tn, risk, origin) :-
+    SignedArgAtSink(f, ca, callee, v, tn, risk),
+    TaintedVar(f, v, v_def, origin, _),
+    DefReachesUse(f, v, v_def, ca).
+
+.output TaintedSignedAtSink
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 7: UNGUARDED CAST — truncation/sign-change without bounds check
+// ════════════════════════════════════════════════════════════════════
+
+.decl GuardedBeforeCast(func: Sym, cast_addr: Addr, src: Sym)
+GuardedBeforeCast(f, cast_a, src) :-
+    Cast(f, cast_a, _, _, src, _, _, _, _, _, _),
+    Guard(f, ga, src, _, _, _, _),
+    CFGEdge(f, _, ga),
+    CFGEdge(f, _, cast_a),
+    ga < cast_a.
+
+.decl UnguardedDangerousCast(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                             kind: Sym, src_type: Sym, dst_type: Sym,
+                             src_width: unsigned, dst_width: unsigned)
+
+// Truncation without prior guard
+UnguardedDangerousCast(f, a, src, dst, "truncate", st, dt, sw, dw) :-
+    TruncationCast(f, a, src, dst, sw, dw, st, dt),
+    !GuardedBeforeCast(f, a, src).
+
+// Sign extension without prior guard
+UnguardedDangerousCast(f, a, src, dst, "sign_extend", st, dt, sw, dw) :-
+    Cast(f, a, dst, _, src, _, "sign_extend", sw, dw, st, dt),
+    !GuardedBeforeCast(f, a, src).
+
+.output UnguardedDangerousCast
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 8: INTEGER OVERFLOW IN NARROW ARITHMETIC BEFORE SINK
+// ════════════════════════════════════════════════════════════════════
+
+.decl NarrowArithAtSink(func: Sym, call_addr: Addr, callee: Sym,
+                        arith_var: Sym, arith_addr: Addr, width: unsigned,
+                        signedness: Sym, risk: Sym)
+
+NarrowArithAtSink(f, ca, callee, dst, arith_a, w, sign, risk) :-
+    ArithOp(f, arith_a, dst, _, _, _, _, _),
+    ResolvedVarType(f, dst, _, _, w, sign),
+    w < 8,
+    Def(f, dst, _, arith_a),
+    DefReachesUse(f, dst, arith_a, ca),
+    Call(f, callee, ca),
+    ActualArg(ca, idx, _, dst, _),
+    DangerousSink(callee, idx, risk).
+
+.output NarrowArithAtSink
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 9: TAINTED NARROW ARITHMETIC — exploitable integer overflow
+// ════════════════════════════════════════════════════════════════════
+
+.decl TaintedNarrowArith(func: Sym, call_addr: Addr, callee: Sym,
+                         arith_var: Sym, width: unsigned, signedness: Sym,
+                         risk: Sym, origin: Sym)
+
+TaintedNarrowArith(f, ca, callee, dst, w, sign, risk, origin) :-
+    NarrowArithAtSink(f, ca, callee, dst, arith_a, w, sign, risk),
+    TaintedVar(f, dst, arith_a, origin, _).
+
+TaintedNarrowArith(f, ca, callee, dst, w, sign, risk, origin) :-
+    NarrowArithAtSink(f, ca, callee, dst, arith_a, w, sign, risk),
+    ArithOp(f, arith_a, dst, _, _, src, _, _),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, arith_a).
+
+.output TaintedNarrowArith
+
+// ════════════════════════════════════════════════════════════════════
+// SUMMARY: All type-safety findings in one relation
+// ════════════════════════════════════════════════════════════════════
+
+.decl TypeSafetyFinding(func: Sym, addr: Addr, category: Sym,
+                        var: Sym, detail: Sym)
+
+TypeSafetyFinding(f, a, "tainted_truncation", src,
+    cat(st, cat("→", cat(dt, cat(" origin=", origin))))) :-
+    TaintedTruncation(f, a, src, _, _, _, st, dt, origin).
+
+TypeSafetyFinding(f, a, "tainted_sign_extend", src,
+    cat(st, cat("→", cat(dt, cat(" origin=", origin))))) :-
+    TaintedSignExtension(f, a, src, _, st, dt, origin).
+
+TypeSafetyFinding(f, a, "tainted_signedness_mismatch", src,
+    cat(st, cat("→", cat(dt, cat(" origin=", origin))))) :-
+    TaintedSignednessMismatch(f, a, src, _, st, dt, origin).
+
+TypeSafetyFinding(f, ca, "tainted_width_at_sink", v,
+    cat(callee, cat(" ", cat(to_string(sw), cat("→", cat(to_string(dw), cat(" origin=", origin))))))) :-
+    TaintedWidthMismatchAtSink(f, ca, callee, v, sw, dw, _, origin).
+
+TypeSafetyFinding(f, ca, "tainted_signed_at_sink", v,
+    cat(callee, cat(" type=", cat(tn, cat(" origin=", origin))))) :-
+    TaintedSignedAtSink(f, ca, callee, v, tn, _, origin).
+
+TypeSafetyFinding(f, a, "unguarded_cast", src,
+    cat(kind, cat(" ", cat(st, cat("→", dt))))) :-
+    UnguardedDangerousCast(f, a, src, _, kind, st, dt, _, _).
+
+TypeSafetyFinding(f, ca, "tainted_narrow_arith", v,
+    cat(callee, cat(" width=", cat(to_string(w), cat(" sign=", cat(sign, cat(" origin=", origin))))))) :-
+    TaintedNarrowArith(f, ca, callee, v, w, sign, _, origin).
+
+TypeSafetyFinding(f, a, "signedness_mismatch", src,
+    cat(st, cat("(", cat(ss, cat(")→", cat(dt, cat("(", cat(ds, ")")))))))) :-
+    SignednessMismatch(f, a, src, _, ss, ds, st, dt).
+
+.output TypeSafetyFinding
