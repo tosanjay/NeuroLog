@@ -172,7 +172,7 @@ def _recycle_outputs_to_facts(output_dir: Path, facts_dir: Path):
 def run_taint_pipeline(
     facts_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
-    timeout: int = 300,
+    timeout: int = 600,
     source_mode: bool = True,
 ) -> dict:
     """Two-pass taint pipeline: alias → interprocedural taint.

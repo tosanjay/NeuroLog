@@ -359,12 +359,15 @@ TaintedVar(caller, cv, ca, origin, ca) :-
     Def(caller, cv, _, ca).
 
 // ── Rule 6b: Callee side-effect — tainted param flows back to caller ──
-// When a callee taints a formal parameter (e.g., fgets writes into buffer
-// param), propagate taint back to the caller's actual argument.
-// This handles pass-by-pointer side effects that Rule 6 (return values) misses.
+// When a callee *modifies* a formal parameter (output param / pass-by-pointer),
+// propagate taint back to the caller's actual argument.
+// Gated on FuncModifiesParam to avoid cross-contamination: without it,
+// Rule 5 taints callee.param (forward), then Rule 6b blindly reflects it
+// back to ALL callers' actual args — even callers that passed clean data.
 TaintedVar(caller, v, ca, origin, ca) :-
     TaintedVar(callee, param, _, origin, _),
     FormalParam(callee, param, idx),
+    FuncModifiesParam(callee, idx),
     Call(caller, callee, ca),
     ActualArg(ca, idx, _, v, _).
 
