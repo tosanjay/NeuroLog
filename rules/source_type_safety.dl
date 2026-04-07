@@ -13,9 +13,9 @@
 // ════════════════════════════════════════════════════════════════════
 
 .type Sym   <: symbol
-.type Addr  <: unsigned
-.type Ver   <: unsigned
-.type Idx   <: unsigned
+.type Addr  <: number      // number, not unsigned — LLM may emit -1
+.type Ver   <: number
+.type Idx   <: number
 
 // ════════════════════════════════════════════════════════════════════
 // INPUT RELATIONS
@@ -23,13 +23,13 @@
 
 // Cast: now includes src_type and dst_type from source code
 .decl Cast(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
-           src: Sym, src_ver: Ver, kind: Sym, src_width: unsigned,
-           dst_width: unsigned, src_type: Sym, dst_type: Sym)
+           src: Sym, src_ver: Ver, kind: Sym, src_width: number,
+           dst_width: number, src_type: Sym, dst_type: Sym)
 .input Cast
 
 // VarType: source-level type info from LLM extraction
 .decl VarType(func: Sym, var: Sym, type_name: Sym,
-              width: unsigned, signedness: Sym)
+              width: number, signedness: Sym)
 .input VarType
 
 // Include type knowledge base (TypeInfo, ResolvedVarType, validation)
@@ -84,7 +84,7 @@ DangerousSink("alloca",  0, "allocation_size").
 // ════════════════════════════════════════════════════════════════════
 
 .decl TruncationCast(func: Sym, addr: Addr, src: Sym, dst: Sym,
-                     src_width: unsigned, dst_width: unsigned,
+                     src_width: number, dst_width: number,
                      src_type: Sym, dst_type: Sym)
 
 TruncationCast(f, a, src, dst, sw, dw, st, dt) :-
@@ -161,7 +161,7 @@ SignednessMismatch(f, a, src, dst, "pointer", ss, st, dt) :-
 // ════════════════════════════════════════════════════════════════════
 
 .decl TaintedTruncation(func: Sym, addr: Addr, src: Sym, dst: Sym,
-                        src_width: unsigned, dst_width: unsigned,
+                        src_width: number, dst_width: number,
                         src_type: Sym, dst_type: Sym, origin: Sym)
 
 TaintedTruncation(f, a, src, dst, sw, dw, st, dt, origin) :-
@@ -205,7 +205,7 @@ TaintedSignednessMismatch(f, a, src, dst, st, dt, origin) :-
 
 .decl WidthMismatchAtSink(func: Sym, call_addr: Addr, callee: Sym,
                           var: Sym, cast_addr: Addr,
-                          src_width: unsigned, dst_width: unsigned, risk: Sym)
+                          src_width: number, dst_width: number, risk: Sym)
 
 WidthMismatchAtSink(f, ca, callee, dst, cast_a, sw, dw, risk) :-
     TruncationCast(f, cast_a, _, dst, sw, dw, _, _),
@@ -238,7 +238,7 @@ SignedArgAtSink(f, ca, callee, v, tn, risk) :-
 // ════════════════════════════════════════════════════════════════════
 
 .decl TaintedWidthMismatchAtSink(func: Sym, call_addr: Addr, callee: Sym,
-                                 var: Sym, src_width: unsigned, dst_width: unsigned,
+                                 var: Sym, src_width: number, dst_width: number,
                                  risk: Sym, origin: Sym)
 
 TaintedWidthMismatchAtSink(f, ca, callee, dst, sw, dw, risk, origin) :-
@@ -287,7 +287,7 @@ GuardedBeforeCast(f, cast_a, src) :-
 
 .decl UnguardedDangerousCast(func: Sym, addr: Addr, src: Sym, dst: Sym,
                              kind: Sym, src_type: Sym, dst_type: Sym,
-                             src_width: unsigned, dst_width: unsigned)
+                             src_width: number, dst_width: number)
 
 // Truncation without prior guard
 UnguardedDangerousCast(f, a, src, dst, "truncate", st, dt, sw, dw) :-
@@ -306,7 +306,7 @@ UnguardedDangerousCast(f, a, src, dst, "sign_extend", st, dt, sw, dw) :-
 // ════════════════════════════════════════════════════════════════════
 
 .decl NarrowArithAtSink(func: Sym, call_addr: Addr, callee: Sym,
-                        arith_var: Sym, arith_addr: Addr, width: unsigned,
+                        arith_var: Sym, arith_addr: Addr, width: number,
                         signedness: Sym, risk: Sym)
 
 NarrowArithAtSink(f, ca, callee, dst, arith_a, w, sign, risk) :-
@@ -326,7 +326,7 @@ NarrowArithAtSink(f, ca, callee, dst, arith_a, w, sign, risk) :-
 // ════════════════════════════════════════════════════════════════════
 
 .decl TaintedNarrowArith(func: Sym, call_addr: Addr, callee: Sym,
-                         arith_var: Sym, width: unsigned, signedness: Sym,
+                         arith_var: Sym, width: number, signedness: Sym,
                          risk: Sym, origin: Sym)
 
 TaintedNarrowArith(f, ca, callee, dst, w, sign, risk, origin) :-

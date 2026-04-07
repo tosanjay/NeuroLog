@@ -10,10 +10,10 @@
 // Run as Pass 4 after source_interproc.dl and source_type_safety.dl.
 
 // ── Types ──────────────────────────────────────────────────────────
-.type Addr <: unsigned
+.type Addr <: number       // number, not unsigned — LLM may emit -1
 .type Sym  <: symbol
-.type Ver  <: unsigned
-.type Idx  <: unsigned
+.type Ver  <: number
+.type Idx  <: number
 
 // ── Input: original facts ──────────────────────────────────────────
 .decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
@@ -48,11 +48,11 @@
 .decl MemRead(func: Sym, addr: Addr, base: Sym, offset: Sym, size: Sym)
 .input MemRead
 
-.decl StackVar(func: Sym, var: Sym, offset: Sym, size: unsigned)
+.decl StackVar(func: Sym, var: Sym, offset: Sym, size: number)
 .input StackVar
 
 .decl VarType(func: Sym, var: Sym, type_name: Sym,
-              width: unsigned, signedness: Sym)
+              width: number, signedness: Sym)
 .input VarType
 
 .decl ReturnVal(func: Sym, var: Sym, ver: Ver)
@@ -210,11 +210,29 @@ TaintedLoopBound(f, ga, lv, lv, op, origin) :-
 .decl BufferOverflowInLoop(func: Sym, guard_addr: Addr, bound_var: Sym,
                            write_addr: Addr, write_type: Sym, origin: Sym)
 
-// MemWrite in loop body after tainted guard
+// Helper: a node is inside a loop if it's reachable from the guard AND
+// can reach back to the guard (backedge).  This excludes post-loop code
+// that the old CFGReach-only rule was matching (source of 40K FPs).
+.decl InLoopBody(func: Sym, guard_addr: Addr, node: Addr)
+InLoopBody(f, ga, n) :-
+    CFGReach(f, ga, n),
+    CFGReach(f, n, ga).
+
+// MemWrite in loop body, involving the loop variable
+// (loop var is Used at the write address — it controls the index/offset)
+BufferOverflowInLoop(f, ga, bv, wa, "mem_write", origin) :-
+    TaintedLoopBound(f, ga, lv, bv, _, origin),
+    MemWrite(f, wa, _, _, _),
+    InLoopBody(f, ga, wa),
+    Use(f, lv, _, wa).
+
+// MemWrite in loop body, involving the tainted bound directly
+// (e.g., while (len--) *dst++ = *src++;  where len is tainted)
 BufferOverflowInLoop(f, ga, bv, wa, "mem_write", origin) :-
     TaintedLoopBound(f, ga, _, bv, _, origin),
     MemWrite(f, wa, _, _, _),
-    CFGReach(f, ga, wa).
+    InLoopBody(f, ga, wa),
+    Use(f, bv, _, wa).
 
 // Call to copy function (memcpy, strcpy, etc.) in loop body
 BufferOverflowInLoop(f, ga, bv, ca, callee, origin) :-
@@ -222,14 +240,14 @@ BufferOverflowInLoop(f, ga, bv, ca, callee, origin) :-
     Call(f, callee, ca),
     (callee = "memcpy" ; callee = "memmove" ; callee = "strcpy" ;
      callee = "strncpy" ; callee = "strcat"),
-    CFGReach(f, ga, ca).
+    InLoopBody(f, ga, ca).
 
 // Loop variable used as index in array write (ArithOp + MemWrite)
 BufferOverflowInLoop(f, ga, bv, wa, "indexed_write", origin) :-
     TaintedLoopBound(f, ga, lv, bv, _, origin),
     ArithOp(f, _, idx, _, "add", _, _, lv),
     MemWrite(f, wa, idx, _, _),
-    CFGReach(f, ga, wa).
+    InLoopBody(f, ga, wa).
 
 .output BufferOverflowInLoop
 

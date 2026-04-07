@@ -19,7 +19,8 @@ def run_souffle(
     custom_rules: str | None = None,
     facts_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
-    timeout: int = 60,
+    timeout: int = 300,
+    clear_output: bool = True,
 ) -> dict:
     """Run a Souffle Datalog query.
 
@@ -29,6 +30,7 @@ def run_souffle(
         facts_dir: Directory containing .facts TSV files.
         output_dir: Directory for .csv output files.
         timeout: Subprocess timeout in seconds.
+        clear_output: If True, remove stale .csv files before running.
 
     Returns:
         Dict with keys: success, outputs (dict of filename → content),
@@ -38,9 +40,10 @@ def run_souffle(
     output_dir = Path(output_dir or DEFAULT_OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clear stale output files
-    for f in output_dir.glob("*.csv"):
-        f.unlink()
+    # Clear stale output files (skip when pipeline manages its own output)
+    if clear_output:
+        for f in output_dir.glob("*.csv"):
+            f.unlink()
 
     # Determine rule file path
     if custom_rules:
@@ -65,7 +68,8 @@ def run_souffle(
             "outputs": {},
         }
 
-    cmd = ["souffle", "-F", str(facts_dir), "-D", str(output_dir), rule_path]
+    cmd = ["souffle", "-F", str(facts_dir), "-D", str(output_dir),
+           "-I", str(RULES_DIR), rule_path]
 
     try:
         result = subprocess.run(
@@ -168,7 +172,7 @@ def _recycle_outputs_to_facts(output_dir: Path, facts_dir: Path):
 def run_taint_pipeline(
     facts_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
-    timeout: int = 60,
+    timeout: int = 300,
     source_mode: bool = True,
 ) -> dict:
     """Two-pass taint pipeline: alias → interprocedural taint.
@@ -183,12 +187,17 @@ def run_taint_pipeline(
     """
     facts_dir = Path(facts_dir or DEFAULT_FACTS_DIR)
     output_dir = Path(output_dir or DEFAULT_OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear output once at the start; individual passes skip clearing
+    for f in output_dir.glob("*.csv"):
+        f.unlink()
 
     interproc_file = "source_interproc.dl" if source_mode else "interproc.dl"
 
     # Pass 1: Alias analysis
     print("  Pass 1: Running alias.dl...")
-    result1 = run_souffle("alias.dl", facts_dir=facts_dir, output_dir=output_dir, timeout=timeout)
+    result1 = run_souffle("alias.dl", facts_dir=facts_dir, output_dir=output_dir, timeout=timeout, clear_output=False)
     if not result1["success"]:
         return {"success": False, "error": f"Pass 1 (alias) failed: {result1.get('stderr', '')}", "outputs": {}}
 
@@ -205,7 +214,9 @@ def run_taint_pipeline(
 
     # Pass 2: Interprocedural taint (source-aware or SSA-based)
     print(f"  Pass 2: Running {interproc_file}...")
-    result2 = run_souffle(interproc_file, facts_dir=facts_dir, output_dir=output_dir, timeout=timeout)
+    result2 = run_souffle(interproc_file, facts_dir=facts_dir, output_dir=output_dir, timeout=timeout, clear_output=False)
+    if not result2["success"]:
+        print(f"    [WARN] Pass 2 ({interproc_file}) failed: {result2.get('stderr', result2.get('error', ''))[:200]}")
 
     # Copy key outputs back to facts/ so subsequent queries can use them as input
     _recycle_outputs_to_facts(output_dir, facts_dir)
@@ -218,7 +229,7 @@ def run_taint_pipeline(
         if type_safety_file.exists():
             print("  Pass 3: Running source_type_safety.dl...")
             result3 = run_souffle("source_type_safety.dl", facts_dir=facts_dir,
-                                  output_dir=output_dir, timeout=timeout)
+                                  output_dir=output_dir, timeout=timeout, clear_output=False)
             if not result3["success"]:
                 print(f"    [WARN] Pass 3 (type_safety) failed: {result3.get('stderr', '')[:200]}")
             _recycle_outputs_to_facts(output_dir, facts_dir)
@@ -231,7 +242,7 @@ def run_taint_pipeline(
         if memsafety_file.exists():
             print("  Pass 4: Running source_memsafety.dl...")
             result4 = run_souffle("source_memsafety.dl", facts_dir=facts_dir,
-                                  output_dir=output_dir, timeout=timeout)
+                                  output_dir=output_dir, timeout=timeout, clear_output=False)
             if not result4["success"]:
                 print(f"    [WARN] Pass 4 (memsafety) failed: {result4.get('stderr', '')[:200]}")
             _recycle_outputs_to_facts(output_dir, facts_dir)
@@ -244,7 +255,7 @@ def run_taint_pipeline(
         if sink_pass_file.exists():
             print("  Pass 5: Running source_sink_pass.dl...")
             result5 = run_souffle("source_sink_pass.dl", facts_dir=facts_dir,
-                                  output_dir=output_dir, timeout=timeout)
+                                  output_dir=output_dir, timeout=timeout, clear_output=False)
             if not result5["success"]:
                 print(f"    [WARN] Pass 5 (sink_pass) failed: {result5.get('stderr', '')[:200]}")
             _recycle_outputs_to_facts(output_dir, facts_dir)

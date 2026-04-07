@@ -11,7 +11,7 @@
 .decl Call(caller:Sym, callee:Sym, addr:Addr) .input Call
 .decl ActualArg(ca:Addr, idx:Idx, name:Sym, expr:Sym, indirect:Idx) .input ActualArg
 .decl DangerousSink(f:Sym, idx:Idx, risk:Sym) .input DangerousSink
-.decl SanitizedVar(f:Sym, v:Sym, def_addr:Addr, sanitize_addr:Addr, guard:Sym) .input SanitizedVar
+.decl SanitizedVar(f:Sym, v:Sym, def_addr:Addr, kill_func:Sym, kill_addr:Addr) .input SanitizedVar
 .decl GuardedSink(callerF:Sym, callee:Sym, ca:Addr, gv:Sym, op:Sym, val:Sym) .input GuardedSink
 
 // ── TaintedSink (main rule) ──

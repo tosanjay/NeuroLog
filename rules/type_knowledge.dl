@@ -17,7 +17,7 @@
 // TypeInfo(type_name, canonical_name, width_bytes, signedness)
 //   canonical_name: normalized form for equivalence (e.g., "uint32" for both uint32_t and "unsigned int")
 //   signedness: "signed", "unsigned", "pointer", "void", "struct"
-.decl TypeInfo(type_name: Sym, canonical: Sym, width: unsigned, signedness: Sym)
+.decl TypeInfo(type_name: Sym, canonical: Sym, width: number, signedness: Sym)
 
 // ── C fundamental types (LP64) ──────────────────────────────────────
 
@@ -120,7 +120,7 @@ TypeInfo("void",             "void",     0, "void").
 // ════════════════════════════════════════════════════════════════════
 
 // Signed-unsigned counterparts (same canonical width, different sign)
-.decl SignedCounterpart(signed_type: Sym, unsigned_type: Sym, width: unsigned)
+.decl SignedCounterpart(signed_type: Sym, unsigned_type: Sym, width: number)
 SignedCounterpart(st, ut, w) :-
     TypeInfo(st, _, w, "signed"),
     TypeInfo(ut, _, w, "unsigned"),
@@ -159,7 +159,7 @@ NarrowsTo(w, n) :-
 // If TypeInfo has the type, use its canonical width/signedness.
 // Otherwise, trust the LLM's extraction.
 .decl ResolvedVarType(func: Sym, var: Sym, type_name: Sym,
-                      canonical: Sym, width: unsigned, signedness: Sym)
+                      canonical: Sym, width: number, signedness: Sym)
 
 // Known type: override LLM width/signedness with ground truth
 ResolvedVarType(f, v, tn, c, w, s) :-
@@ -190,7 +190,7 @@ UnknownType(f, v, tn) :-
 
 // Width/signedness mismatch between LLM and knowledge base
 .decl TypeInfoMismatch(func: Sym, var: Sym, type_name: Sym,
-                       llm_width: unsigned, kb_width: unsigned,
+                       llm_width: number, kb_width: number,
                        llm_sign: Sym, kb_sign: Sym)
 
 TypeInfoMismatch(f, v, tn, lw, kw, ls, ks) :-

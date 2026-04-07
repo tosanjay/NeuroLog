@@ -7,10 +7,10 @@
 // Requires CFGEdge facts — without them, only same-line def-use works.
 
 // ── Type declarations ──────────────────────────────────────────────
-.type Addr <: unsigned      // source line number
+.type Addr <: number       // number, not unsigned — LLM may emit -1 for implicit returns
 .type Sym  <: symbol
-.type Ver  <: unsigned      // always 0 for source code (schema compat)
-.type Idx  <: unsigned
+.type Ver  <: number       // always 0 for source code (schema compat)
+.type Idx  <: number
 
 // ── Input relations ────────────────────────────────────────────────
 .decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)

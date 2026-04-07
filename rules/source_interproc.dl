@@ -9,10 +9,10 @@
 //   - Phi merges handled implicitly by CFG (no PhiSource needed)
 
 // ── Types ──────────────────────────────────────────────────────────
-.type Addr <: unsigned
+.type Addr <: number       // number, not unsigned — LLM may emit -1 for implicit returns
 .type Sym  <: symbol
-.type Ver  <: unsigned
-.type Idx  <: unsigned
+.type Ver  <: number
+.type Idx  <: number
 
 // ── Input relations ────────────────────────────────────────────────
 .decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)

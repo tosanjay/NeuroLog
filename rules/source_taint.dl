@@ -7,10 +7,10 @@
 // Self-contained: includes reaching-definitions rules inline.
 
 // ── Types ──────────────────────────────────────────────────────────
-.type Addr <: unsigned
+.type Addr <: number       // number, not unsigned — LLM may emit -1
 .type Sym  <: symbol
-.type Ver  <: unsigned
-.type Idx  <: unsigned
+.type Ver  <: number
+.type Idx  <: number
 
 // ── Input relations ────────────────────────────────────────────────
 .decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
