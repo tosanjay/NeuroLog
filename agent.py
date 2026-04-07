@@ -4,8 +4,12 @@
 
 import os
 import sys
+import json
 import subprocess
 import tempfile
+import urllib.request
+import urllib.parse
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -32,7 +36,7 @@ def _import(name: str):
 from dotenv import load_dotenv
 
 from google.adk.agents import LlmAgent
-from google.adk.tools import FunctionTool
+from google.adk.tools import FunctionTool, ToolContext
 from google.adk.models.lite_llm import LiteLlm
 
 load_dotenv(override=True)
@@ -41,6 +45,9 @@ load_dotenv(override=True)
 # Configuration
 # =============================================================================
 MODEL_NAME = os.getenv("MODEL_NAME", "anthropic/claude-sonnet-4-6")
+# Sub-agents that don't need deep reasoning can use a cheaper model.
+# Extraction + routing use LITE_MODEL; interpretation uses MODEL_NAME.
+LITE_MODEL_NAME = os.getenv("LITE_MODEL_NAME", MODEL_NAME)
 
 # Smart extraction routing: use batch API for jobs larger than this threshold
 BATCH_THRESHOLD = int(os.getenv("BATCH_THRESHOLD", "5"))
@@ -49,6 +56,11 @@ PROJECT_DIR = Path(__file__).parent
 RULES_DIR = PROJECT_DIR / "rules"
 FACTS_DIR = PROJECT_DIR / "facts"
 OUTPUT_DIR = PROJECT_DIR / "output"
+
+# Context window budget: truncate tool returns to prevent ADK conversation overflow
+# A ~1M context model ≈ 800K usable tokens; leave room for agent instruction + history
+MAX_SOURCE_LINES_RETURN = int(os.getenv("MAX_SOURCE_LINES_RETURN", "300"))
+MAX_FUNCTION_LINES_EXTRACT = int(os.getenv("MAX_FUNCTION_LINES_EXTRACT", "500"))
 
 
 def _resolve_api_key():
@@ -76,8 +88,15 @@ def _use_batch_api() -> bool:
         return False
 
 
-def create_model():
-    return LiteLlm(model=MODEL_NAME, api_key=_resolve_api_key())
+def create_model(lite: bool = False):
+    """Create a LiteLLM model instance.
+
+    Args:
+        lite: If True, use LITE_MODEL_NAME (cheaper, for routing/extraction).
+              If False, use MODEL_NAME (full model, for reasoning/interpretation).
+    """
+    name = LITE_MODEL_NAME if lite else MODEL_NAME
+    return LiteLlm(model=name, api_key=_resolve_api_key())
 
 
 # =============================================================================
@@ -149,6 +168,26 @@ def tool_scan_project(
     ]
 
     cg_simple = {k: sorted(v) for k, v in cg.items()}
+
+    # For large projects, return compact summaries to avoid context overflow
+    if len(func_list) > 50:
+        # Group by file, show counts per file + only sink-related functions in detail
+        file_groups = {}
+        for f in func_list:
+            file_groups.setdefault(f["file"], []).append(f["name"])
+        file_summary = {fp: {"count": len(names), "functions": names[:10],
+                             "truncated": len(names) > 10}
+                        for fp, names in file_groups.items()}
+        return {
+            "function_count": len(func_list),
+            "files": file_summary,
+            "call_graph_edges": sum(len(v) for v in cg_simple.values()),
+            "dangerous_sinks": sinks,
+            "sink_count": len(sinks),
+            "note": (f"Large project ({len(func_list)} functions). "
+                     f"Function list grouped by file (first 10 per file shown). "
+                     f"Use tool_build_slice() to identify the targeted analysis set."),
+        }
 
     return {
         "functions": func_list,
@@ -233,16 +272,32 @@ def tool_read_source(
         return {"error": f"File not found: {file_path}"}
 
     lines = p.read_text().split('\n')
+    total_lines = len(lines)
     start = max(0, start_line - 1) if start_line > 0 else 0
-    end = end_line if end_line > 0 else len(lines)
+    end = end_line if end_line > 0 else total_lines
     selected = lines[start:end]
+
+    # Truncate to prevent context window overflow in ADK conversation
+    truncated = False
+    if len(selected) > MAX_SOURCE_LINES_RETURN:
+        selected = selected[:MAX_SOURCE_LINES_RETURN]
+        truncated = True
 
     numbered = []
     for i, line in enumerate(selected):
         numbered.append(f"{start + i + 1:4d}| {line}")
 
-    return {"source": '\n'.join(numbered), "start_line": start + 1,
-            "end_line": start + len(selected), "file": file_path}
+    result = {"source": '\n'.join(numbered), "start_line": start + 1,
+              "end_line": start + len(selected), "total_lines": total_lines,
+              "file": file_path}
+    if truncated:
+        result["truncated"] = True
+        result["warning"] = (
+            f"File has {total_lines} lines — showing first {MAX_SOURCE_LINES_RETURN}. "
+            f"Use start_line/end_line to read specific ranges, or func_name to "
+            f"extract a specific function."
+        )
+    return result
 
 
 # =============================================================================
@@ -279,14 +334,52 @@ def tool_extract_facts_llm(
         return {"error": f"Function '{func_name}' not found in {file_path}"}
 
     source, start_line = result
+    source_lines = source.split('\n')
 
-    facts = _extract(
-        function_source=source,
-        func_name=func_name,
-        file_path=file_path,
-        model=MODEL_NAME,
-        api_key=_resolve_api_key(),
-    )
+    # Large function chunking: split into overlapping chunks to stay within
+    # the LLM context window. Each chunk gets extracted separately and facts
+    # are merged.  Overlap ensures no facts are lost at chunk boundaries.
+    if len(source_lines) > MAX_FUNCTION_LINES_EXTRACT:
+        chunk_size = MAX_FUNCTION_LINES_EXTRACT
+        overlap = 30  # lines of overlap between chunks
+        facts = []
+        chunk_idx = 0
+        pos = 0
+        while pos < len(source_lines):
+            chunk_end = min(pos + chunk_size, len(source_lines))
+            chunk = '\n'.join(source_lines[pos:chunk_end])
+            chunk_idx += 1
+            print(f"  [chunk {chunk_idx}] lines {pos+1}-{chunk_end} of {len(source_lines)}")
+            try:
+                chunk_facts = _extract(
+                    function_source=chunk,
+                    func_name=func_name,
+                    file_path=file_path,
+                    model=MODEL_NAME,
+                    api_key=_resolve_api_key(),
+                )
+                facts.extend(chunk_facts)
+            except Exception as e:
+                print(f"  [chunk {chunk_idx} ERROR] {e}")
+            pos = chunk_end - overlap if chunk_end < len(source_lines) else chunk_end
+
+        # Deduplicate facts (same kind+func+addr+fields)
+        seen = set()
+        unique_facts = []
+        for f in facts:
+            key = (f.kind, f.func, f.addr, tuple(sorted(f.fields.items())))
+            if key not in seen:
+                seen.add(key)
+                unique_facts.append(f)
+        facts = unique_facts
+    else:
+        facts = _extract(
+            function_source=source,
+            func_name=func_name,
+            file_path=file_path,
+            model=MODEL_NAME,
+            api_key=_resolve_api_key(),
+        )
 
     stats = write_facts(facts, FACTS_DIR, append=True)
 
@@ -406,11 +499,22 @@ def tool_extract_slice(
         verified[f.name] = actual_lines
 
     total_on_disk = sum(verified.values())
+
+    # Compact per-function results: only name, fact count, and errors
+    compact_results = []
+    for r in results:
+        entry = {"name": r.get("name", "?")}
+        if "facts" in r:
+            entry["facts"] = r["facts"]
+        if "error" in r:
+            entry["error"] = r["error"]
+        compact_results.append(entry)
+
     result_dict = {
         "extraction_mode": mode,
         "functions_extracted": len([r for r in results if "facts" in r]),
         "total_facts": len(all_facts),
-        "per_function": results,
+        "per_function": compact_results,
         "facts_on_disk": verified,
         "total_on_disk": total_on_disk,
         "missing_functions": missing,
@@ -431,14 +535,20 @@ def _extract_sequential(func_sources: list[dict], write_facts) -> tuple:
 
     for fs in func_sources:
         entry = {"name": fs["name"], "file": fs["file_path"]}
+        source_lines = fs["source"].split('\n')
         try:
-            facts = _extract(
-                function_source=fs["source"],
-                func_name=fs["name"],
-                file_path=fs["file_path"],
-                model=MODEL_NAME,
-                api_key=_resolve_api_key(),
-            )
+            if len(source_lines) > MAX_FUNCTION_LINES_EXTRACT:
+                # Chunk large functions
+                facts = _extract_chunked(
+                    _extract, fs["source"], fs["name"], fs["file_path"])
+            else:
+                facts = _extract(
+                    function_source=fs["source"],
+                    func_name=fs["name"],
+                    file_path=fs["file_path"],
+                    model=MODEL_NAME,
+                    api_key=_resolve_api_key(),
+                )
             entry["facts"] = len(facts)
             all_facts.extend(facts)
         except Exception as e:
@@ -449,6 +559,43 @@ def _extract_sequential(func_sources: list[dict], write_facts) -> tuple:
         write_facts(all_facts, FACTS_DIR, append=True)
 
     return all_facts, results, "sequential"
+
+
+def _extract_chunked(extract_fn, source: str, func_name: str, file_path: str) -> list:
+    """Extract facts from a large function by splitting into overlapping chunks."""
+    source_lines = source.split('\n')
+    chunk_size = MAX_FUNCTION_LINES_EXTRACT
+    overlap = 30
+    facts = []
+    chunk_idx = 0
+    pos = 0
+    while pos < len(source_lines):
+        chunk_end = min(pos + chunk_size, len(source_lines))
+        chunk = '\n'.join(source_lines[pos:chunk_end])
+        chunk_idx += 1
+        print(f"  [chunk {chunk_idx}] {func_name}: lines {pos+1}-{chunk_end} of {len(source_lines)}")
+        try:
+            chunk_facts = extract_fn(
+                function_source=chunk,
+                func_name=func_name,
+                file_path=file_path,
+                model=MODEL_NAME,
+                api_key=_resolve_api_key(),
+            )
+            facts.extend(chunk_facts)
+        except Exception as e:
+            print(f"  [chunk {chunk_idx} ERROR] {e}")
+        pos = chunk_end - overlap if chunk_end < len(source_lines) else chunk_end
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for f in facts:
+        key = (f.kind, f.func, f.addr, tuple(sorted(f.fields.items())))
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
 
 
 def _extract_batch(func_sources: list[dict], write_facts) -> tuple:
@@ -594,7 +741,23 @@ def tool_read_file(file_path: str) -> dict:
         return {"error": f"File not found: {p}"}
 
     content = p.read_text()
-    return {"path": str(p), "size_bytes": p.stat().st_size, "content": content}
+    lines = content.split('\n')
+    total_lines = len(lines)
+
+    # Cap content returned to prevent context overflow
+    max_lines = MAX_SOURCE_LINES_RETURN
+    if total_lines > max_lines:
+        content = '\n'.join(lines[:max_lines])
+        return {
+            "path": str(p), "size_bytes": p.stat().st_size,
+            "total_lines": total_lines, "showing": max_lines,
+            "content": content,
+            "truncated": True,
+            "hint": f"Showing first {max_lines} of {total_lines} lines. "
+                    f"Full file at: {p}",
+        }
+    return {"path": str(p), "size_bytes": p.stat().st_size,
+            "total_lines": total_lines, "content": content}
 
 
 # =============================================================================
@@ -849,177 +1012,625 @@ def tool_extraction_metrics() -> dict:
 
 
 # =============================================================================
-# Agent instruction prompt
+# Tool: Save analysis report
 # =============================================================================
-AGENT_INSTRUCTION = """You are **SourceCodeQL**, an interactive source code analysis co-pilot.
-You help security researchers analyze C/C++ source code using Datalog queries
-over facts extracted directly from source code by an LLM — no compilation required.
+def tool_save_report(
+    content: str,
+    target_name: str = "",
+    report_dir: str = "",
+) -> dict:
+    """Save an analysis report as a Markdown file when the user requests it.
 
-## Your capabilities
+    The filename is auto-generated from the target being analyzed and a
+    timestamp, e.g. ``cjson_parse_2026-04-06_14-30.md``.
 
-1. **Project scanning** (tree-sitter, no compilation) — Enumerate functions, build
-   call graphs, find dangerous sinks, backward-slice to identify analysis targets.
+    The report MUST follow this structure (use Markdown headings):
+    1. **Executive Summary** — one-paragraph overview
+    2. **Issues Found** — table/list of each finding with: vulnerability type,
+       location (file:line), severity (High/Medium/Low/Info)
+    3. **Root Cause Analysis** — for each issue: positive (confirmed) or
+       negative (ruled out), with the Datalog query/relation that backs it
+    4. **Reachability** — file-level scope if single-file analysis, or
+       project-level call-graph reachability if whole-repo analysis
+    5. **Exploitability Assessment** — for each confirmed issue: why/how it
+       is exploitable (or why not), required input structure or triggering
+       conditions, attack surface entry points
+    6. **CVE Cross-Reference** — known CVE matches (if tool_search_cve was used)
+    7. **Datalog Evidence** — key queries and their raw output
+    8. **Recommendations** — prioritized remediation steps
 
-2. **LLM fact extraction** — Extract Datalog facts (Def, Use, Call, MemRead, MemWrite,
-   Guard, Cast, StackVar, VarType, etc.) from C functions using the LLM. The LLM
-   reads source code directly — no AST, no CFG, no SSA compiler needed. Facts are
-   written as .facts TSV files for Souffle.
-   - **Smart routing**: Single functions extract instantly (synchronous). Large slice
-     jobs (>5 functions) automatically use the Anthropic Batch API for 50% cost
-     reduction and zero rate-limit pressure. This is transparent to the user.
+    Only call this tool when the user explicitly asks to save/generate a report.
 
-3. **Souffle Datalog engine** — Run pre-built or custom Datalog queries:
-   - `interproc.dl` — 1-CFA context-sensitive interprocedural taint analysis
-   - `taint.dl` — Intraprocedural taint tracking
-   - `alias.dl` — Andersen-style points-to analysis
-   - `patterns.dl` — Structural vulnerability heuristics (unsafe strcpy, gets)
-   - `patterns_mem.dl` — Memory safety: UAF, double-free, unchecked malloc
-   - `core.dl` — Basic def-use and reachability queries
-   - `summary.dl` — Function summary computation
-   - `signatures.dl` — Library function taint transfer models
-   - Custom `.dl` programs composed on the fly
+    Args:
+        content: The full Markdown report content.
+        target_name: Short label for what was analyzed (e.g. a filename like
+                     "cjson.c" or a project name like "libpng").  If empty,
+                     defaults to "analysis".
+        report_dir: Directory to save into.  Defaults to the project output/ dir.
 
-4. **Taint analysis** — Two-pass pipeline: alias analysis → interprocedural taint.
-   Tracks attacker-controlled data from entry points through function calls to sinks.
+    Returns:
+        Dict with the saved file path and size.
+    """
+    out = Path(report_dir) if report_dir else OUTPUT_DIR
+    out.mkdir(parents=True, exist_ok=True)
 
-5. **Validation** — Compare LLM-extracted facts against tree-sitter ground truth
-   to measure extraction accuracy per fact kind.
+    # Build intuitive filename: <target>_<timestamp>.md
+    label = target_name.strip() if target_name else "analysis"
+    # Sanitize: keep alphanums, hyphens, underscores
+    label = "".join(c if (c.isalnum() or c in "-_") else "_" for c in label)
+    label = label.strip("_") or "analysis"
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    filename = f"{label}_{ts}.md"
 
-## Fact schema reference
+    path = out / filename
+    path.write_text(content, encoding="utf-8")
 
-| Relation | Columns | Source |
-|----------|---------|--------|
-| Def | func, var, ver, addr | LLM |
-| Use | func, var, ver, addr | LLM |
-| Call | caller, callee, addr | LLM |
-| ActualArg | call_addr, arg_idx, param, var, ver | LLM |
-| ReturnVal | func, var, ver | LLM |
-| FormalParam | func, var, idx | LLM |
-| MemRead | func, addr, base, offset, size | LLM (semantic) |
-| MemWrite | func, addr, target, mem_in, mem_out | LLM (semantic) |
-| FieldRead | func, addr, base, field | LLM |
-| FieldWrite | func, addr, base, field, mem_in, mem_out | LLM |
-| AddressOf | func, var, ver, target | LLM |
-| CFGEdge | func, from_addr, to_addr | LLM |
-| Guard | func, addr, var, ver, op, bound, bound_type | LLM (semantic) |
-| ArithOp | func, addr, dst, dst_ver, op, src, src_ver, operand | LLM |
-| Cast | func, addr, dst, dst_ver, src, src_ver, kind, src_width, dst_width, src_type, dst_type | LLM (semantic) |
-| StackVar | func, var, offset, size | LLM (semantic) |
-| VarType | func, var, type_name, width, signedness | LLM (semantic) |
-| DangerousSink | func, arg_idx, risk | Generated |
-| TaintSourceFunc | name, category | Generated |
-| EntryTaint | func, param_idx | User-specified |
+    return {
+        "path": str(path),
+        "filename": filename,
+        "size_bytes": path.stat().st_size,
+    }
 
-Addresses are source **line numbers** (not hex). SSA ver=0 (flow-insensitive MVP).
 
-"LLM (semantic)" marks facts that only the LLM can extract — they require understanding
-code semantics beyond what a parser can provide (type sizes, library function behavior,
-pointer semantics).
+# =============================================================================
+# Tool: Search CVE / NVD database
+# =============================================================================
+def tool_search_cve(
+    keyword: str,
+    max_results: int = 5,
+) -> dict:
+    """Search the NIST National Vulnerability Database (NVD) for known CVEs.
 
-## Recommended workflow
+    Use this after finding a vulnerability to check if it matches a known CVE.
+    Search by software name, vulnerability type, or CWE ID.
 
-1. **Scan project** — `tool_scan_project(project_dir)` to enumerate functions and find sinks.
-2. **Build slice** — `tool_build_slice(project_dir)` to backward-trace from sinks.
-3. **Clean workspace** — `tool_clean_workspace()` to start fresh.
-4. **Extract facts** — `tool_extract_slice(project_dir)` for the full slice, or
-   `tool_extract_facts_llm(file, func)` for individual functions.
-5. **Generate annotations** — `tool_generate_annotations()` for sink/source catalogs.
-6. **Generate signatures** — `tool_generate_signatures()` for taint transfer models.
-7. **Set entry taint** — `tool_set_entry_taint(entries)` to mark attack surface.
-8. **Run analysis** — `tool_run_taint_pipeline()` for full interprocedural taint, or
-   `tool_run_souffle(rule_file)` for specific analyses.
-9. **Interpret results** — Read output CSVs and explain findings.
+    Examples:
+        tool_search_cve("cJSON buffer overflow")
+        tool_search_cve("CWE-416 use-after-free libxml2")
+        tool_search_cve("CVE-2023-31047")
 
-## Writing custom Datalog queries
+    Args:
+        keyword: Search terms — software name, CWE, CVE ID, or description keywords.
+        max_results: Maximum CVEs to return (default: 5, max: 20).
 
-Compose custom queries with `tool_run_souffle(custom_rules=...)`:
+    Returns:
+        Dict with matched CVEs including ID, description, severity, and references.
+    """
+    max_results = min(max_results, 20)
+
+    # NVD API 2.0 — free, no API key required (rate-limited to 5 req/30s)
+    base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+    # If the keyword looks like a specific CVE ID, use direct lookup
+    keyword_stripped = keyword.strip()
+    if keyword_stripped.upper().startswith("CVE-"):
+        params = {"cveId": keyword_stripped.upper()}
+    else:
+        params = {"keywordSearch": keyword_stripped, "resultsPerPage": str(max_results)}
+
+    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "SourceCodeQL-Agent/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"error": f"NVD API HTTP {e.code}: {e.reason}"}
+    except urllib.error.URLError as e:
+        return {"error": f"NVD API unreachable: {e.reason}"}
+    except Exception as e:
+        return {"error": f"NVD API request failed: {str(e)}"}
+
+    vulns = data.get("vulnerabilities", [])
+    results = []
+    for item in vulns[:max_results]:
+        cve = item.get("cve", {})
+        cve_id = cve.get("id", "unknown")
+
+        # Extract English description
+        descriptions = cve.get("descriptions", [])
+        desc = next((d["value"] for d in descriptions if d.get("lang") == "en"), "")
+
+        # Extract CVSS score (prefer v3.1, fall back to v3.0, then v2)
+        metrics = cve.get("metrics", {})
+        severity = "unknown"
+        score = None
+        for ver in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
+            if ver in metrics and metrics[ver]:
+                cvss_data = metrics[ver][0].get("cvssData", {})
+                score = cvss_data.get("baseScore")
+                severity = cvss_data.get("baseSeverity", "unknown")
+                break
+
+        # Extract CWE IDs
+        weaknesses = cve.get("weaknesses", [])
+        cwes = []
+        for w in weaknesses:
+            for d in w.get("description", []):
+                if d.get("value", "").startswith("CWE-"):
+                    cwes.append(d["value"])
+
+        # Extract references (first 3)
+        refs = [r.get("url", "") for r in cve.get("references", [])[:3]]
+
+        results.append({
+            "cve_id": cve_id,
+            "description": desc[:500],  # Truncate long descriptions
+            "cvss_score": score,
+            "severity": severity,
+            "cwes": cwes,
+            "references": refs,
+            "published": cve.get("published", ""),
+        })
+
+    return {
+        "query": keyword,
+        "total_results": data.get("totalResults", 0),
+        "results": results,
+    }
+
+
+# =============================================================================
+# Tool: Run full analysis pipeline (pure Python — no conversation overhead)
+# =============================================================================
+def tool_run_full_pipeline(
+    project_dir: str,
+    function_names: list[str] = None,
+    depth: int = 3,
+    extensions: str = ".c",
+    skip_scan: bool = False,
+    skip_extract: bool = False,
+    tool_context: ToolContext = None,
+) -> dict:
+    """Run the complete analysis pipeline: scan → slice → extract → analyze.
+
+    Executes all phases as pure Python computation. Intermediate data flows
+    through disk (facts/*.facts → output/*.csv), NOT through the conversation.
+    Only a compact summary is returned to the agent.
+
+    Use this for large projects to avoid context window overflow. For small
+    projects or step-by-step interactive analysis, use individual tools instead.
+
+    Args:
+        project_dir: Path to the source code directory.
+        function_names: If provided, extract only these functions (skip scan/slice).
+        depth: Backward slice depth for sink detection (default: 3).
+        extensions: Comma-separated file extensions (default: ".c").
+        skip_scan: Skip the scan phase (use if already scanned).
+        skip_extract: Skip extraction (use if facts already exist on disk).
+        tool_context: ADK-injected context for session state persistence.
+
+    Returns:
+        Compact summary dict (~500 bytes) with per-phase stats and findings overview.
+    """
+    summary = {"project_dir": project_dir, "phases": {}}
+    errors = []
+
+    # Phase 1: Scan project
+    if not skip_scan and not function_names:
+        print("  [pipeline] Phase 1: Scanning project...")
+        try:
+            scan_result = tool_scan_project(project_dir, extensions)
+            summary["phases"]["scan"] = {
+                "function_count": scan_result.get("function_count", 0),
+                "sink_count": scan_result.get("sink_count", 0),
+            }
+        except Exception as e:
+            errors.append(f"scan: {e}")
+
+    # Phase 2: Build slice (or use provided function_names)
+    targets = function_names
+    if not targets:
+        print("  [pipeline] Phase 2: Building backward slice...")
+        try:
+            slice_result = tool_build_slice(project_dir, depth=depth, extensions=extensions)
+            targets = [f["name"] for f in slice_result.get("slice", [])]
+            summary["phases"]["slice"] = {"target_count": len(targets)}
+        except Exception as e:
+            errors.append(f"slice: {e}")
+            targets = []
+
+    if not targets:
+        summary["errors"] = errors or ["No target functions found"]
+        return summary
+
+    summary["phases"]["targets"] = {"count": len(targets), "names": targets[:20]}
+
+    # Phase 3: Clean + Extract
+    if not skip_extract:
+        print(f"  [pipeline] Phase 3: Extracting facts for {len(targets)} functions...")
+        tool_clean_workspace()
+        try:
+            extract_result = tool_extract_slice(
+                project_dir, function_names=targets, extensions=extensions)
+            summary["phases"]["extract"] = {
+                "mode": extract_result.get("extraction_mode", "unknown"),
+                "functions_extracted": extract_result.get("functions_extracted", 0),
+                "total_facts": extract_result.get("total_facts", 0),
+                "total_on_disk": extract_result.get("total_on_disk", 0),
+            }
+            if extract_result.get("warning"):
+                errors.append(extract_result["warning"])
+        except Exception as e:
+            errors.append(f"extract: {e}")
+
+    # Phase 4: Annotations + Signatures
+    print("  [pipeline] Phase 4: Generating annotations and signatures...")
+    try:
+        ann = tool_generate_annotations()
+        summary["phases"]["annotations"] = {
+            "sinks": ann.get("sinks", 0), "sources": ann.get("sources", 0)}
+    except Exception as e:
+        errors.append(f"annotations: {e}")
+
+    try:
+        tool_generate_signatures()
+    except Exception as e:
+        errors.append(f"signatures: {e}")
+
+    # Phase 5: Taint pipeline (5-pass Souffle)
+    print("  [pipeline] Phase 5: Running taint analysis pipeline...")
+    try:
+        pipeline_result = tool_run_taint_pipeline()
+        # Collect finding counts from output CSVs (compact)
+        findings = {}
+        for csv_file in OUTPUT_DIR.glob("*.csv"):
+            content = csv_file.read_text().strip()
+            if content:
+                findings[csv_file.stem] = content.count('\n') + 1
+        summary["phases"]["analysis"] = {
+            "success": pipeline_result.get("success", False),
+            "output_files": findings,
+        }
+    except Exception as e:
+        errors.append(f"analysis: {e}")
+
+    # Compile final summary
+    findings = summary.get("phases", {}).get("analysis", {}).get("output_files", {})
+    key_findings = {k: v for k, v in findings.items()
+                    if k in ("TaintedSink", "TaintControlledSink", "UnguardedTaintedSink",
+                             "UseAfterFree", "DoubleFree", "MemSafetyFinding",
+                             "TypeSafetyFinding", "BufferOverflowInLoop")}
+    summary["key_findings"] = key_findings
+    summary["total_finding_rows"] = sum(key_findings.values()) if key_findings else 0
+
+    if errors:
+        summary["errors"] = errors
+
+    # Store in session state for sub-agents
+    if tool_context:
+        tool_context.state["project_dir"] = project_dir
+        tool_context.state["scan_summary"] = str(summary.get("phases", {}).get("scan", {}))
+        tool_context.state["slice_targets"] = str(summary.get("phases", {}).get("targets", {}))
+        tool_context.state["extraction_summary"] = str(summary.get("phases", {}).get("extract", {}))
+        tool_context.state["analysis_summary"] = str(summary.get("phases", {}).get("analysis", {}))
+        tool_context.state["key_findings"] = str(key_findings)
+        tool_context.state["pipeline_complete"] = "true"
+
+    print(f"  [pipeline] Done. {summary.get('total_finding_rows', 0)} key finding rows.")
+    return summary
+
+
+# =============================================================================
+# Agent instruction prompts
+# =============================================================================
+# =============================================================================
+# Coordinator instruction (lightweight — routing + pipeline)
+# =============================================================================
+COORDINATOR_INSTRUCTION = """You are **SourceCodeQL**, a source code vulnerability analysis coordinator.
+You help security researchers analyze C/C++ source code using Datalog-based formal reasoning.
+
+## How to handle requests
+
+**For large projects or "analyze this project" requests:**
+Use `tool_run_full_pipeline(project_dir)` — it runs the entire scan-extract-analyze
+pipeline as pure computation (no conversation overhead) and returns a compact summary.
+Then transfer to `InterpreterAgent` to explain findings, or `CVEAgent` to check known CVEs.
+
+**For small projects or step-by-step interactive analysis:**
+Use individual tools directly:
+1. `tool_scan_project(dir)` → enumerate functions, find sinks
+2. `tool_build_slice(dir)` → backward-trace from sinks
+3. Transfer to `ExtractionAgent` for fact extraction
+4. Transfer to `AnalysisAgent` for Souffle queries
+5. Transfer to `InterpreterAgent` for findings interpretation
+
+**For reports:** Transfer to `InterpreterAgent` — only when user explicitly asks.
+**For CVE lookup:** Transfer to `CVEAgent`.
+
+## Sub-agent routing
+
+- **ExtractionAgent** — LLM fact extraction from source code. Use when user wants to extract
+  facts for specific functions or validate extraction accuracy.
+- **AnalysisAgent** — Souffle Datalog queries, taint pipeline, custom rules. Use when user
+  wants to run analysis or compose custom Datalog queries.
+- **InterpreterAgent** — Read analysis results, interpret findings, generate reports.
+  Use after pipeline completes, or when user asks for findings/report.
+- **CVEAgent** — Search NIST NVD for known CVEs. Use after findings are available.
+
+## Important rules
+
+- Never read entire large files. Use `func_name` param or line ranges.
+- Always slice before extracting for projects with >20 functions.
+- Be concise. Lead with findings, not process description.
+"""
+
+
+# =============================================================================
+# Sub-agent instructions
+# =============================================================================
+EXTRACTION_INSTRUCTION = """You are the **Extraction Agent** for SourceCodeQL.
+You extract Datalog facts from C/C++ source code using LLM-based analysis.
+
+Project context: {project_dir}
+Scan results: {scan_summary}
+Slice targets: {slice_targets}
+
+## Tools available
+- `tool_extract_facts_llm(file, func)` — Extract facts for one function
+- `tool_extract_slice(dir, function_names)` — Batch extract for multiple functions
+- `tool_validate_extraction(file, func)` — Compare LLM vs tree-sitter accuracy
+- `tool_extraction_metrics()` — Token usage and cost stats
+
+## Rules
+- Facts are written to disk as .facts TSV files (accumulative).
+- Large functions (>500 lines) are auto-chunked — transparent to you.
+- Large jobs (>5 functions, Anthropic model) auto-route to Batch API.
+- After extraction, summarize: functions extracted, total facts, any errors.
+- Transfer back to coordinator when done.
+"""
+
+ANALYSIS_INSTRUCTION = """You are the **Analysis Agent** for SourceCodeQL.
+You run Souffle Datalog queries over extracted facts to find vulnerabilities.
+
+Extraction results: {extraction_summary}
+
+## Tools available
+- `tool_run_souffle(rule_file, custom_rules)` — Run Datalog queries
+- `tool_run_taint_pipeline()` — Full 5-pass pipeline (alias → interproc → type → mem → sink)
+- `tool_generate_annotations(extra_sources, extra_sinks)` — Sink/source catalogs
+- `tool_generate_signatures(extra_signatures)` — Taint transfer models
+- `tool_set_entry_taint(entries)` — Mark attacker-controlled params
+- `tool_read_file(path)` — Read rule/fact/output files
+
+## Available rule files
+- `interproc.dl` / `source_interproc.dl` — Interprocedural taint
+- `alias.dl` — Points-to analysis
+- `taint.dl` — Intraprocedural taint
+- `patterns.dl` — Structural heuristics
+- `patterns_mem.dl` / `source_memsafety.dl` — Memory safety (UAF, double-free)
+- `source_type_safety.dl` — Type safety (integer overflow, truncation)
+- `core.dl` — Basic def-use, reachability
+- `summary.dl` — Function summaries
+- `signatures.dl` — Library taint transfer models
+
+## Custom queries
+Compose with `tool_run_souffle(custom_rules=...)`:
 ```
 .type Sym <: symbol
 .type Addr <: unsigned
 .decl Call(caller: Sym, callee: Sym, addr: Addr)
 .input Call
-.decl CallerOfMemcpy(func: Sym)
-CallerOfMemcpy(f) :- Call(f, "memcpy", _).
-.output CallerOfMemcpy
+.decl CallerOfFree(func: Sym)
+CallerOfFree(f) :- Call(f, "free", _).
+.output CallerOfFree
 ```
 
 ## CRITICAL: Datalog-first reasoning discipline
 
-**Every finding you report MUST be derived from a Datalog query — never from prose reasoning alone.**
+**Every finding MUST be derived from a Datalog query — never from prose reasoning alone.**
 
-This is the core principle of neuro-symbolic analysis: the LLM perceives (extracts facts),
-Datalog reasons (derives conclusions). You must NOT reason about data flow, control flow,
-reachability, or vulnerability conditions in your head — that is Datalog's job.
+1. **No finding without a query.** Run a Datalog query that produces the finding as output.
+2. **No prose-based data flow reasoning.** Write Datalog rules, not narratives.
+3. **Cross-check every finding** with verification queries for guards/sanitizers.
+4. **When in doubt, query.** A 3-line query returning empty beats a paragraph of reasoning.
+5. **Distinguish Datalog-derived vs. observations.** Label observations as unverified.
 
-### Rules:
+Transfer back to coordinator when analysis is complete.
+"""
 
-1. **No finding without a query.** Before reporting any finding (vulnerability, taint path,
-   safety issue), you MUST have run a Datalog query that produces the finding as output.
-   If you suspect something is vulnerable, write a Datalog rule to test it — don't assert
-   it from prose reasoning.
+INTERPRETER_INSTRUCTION = """You are the **Interpreter Agent** for SourceCodeQL.
+You read analysis results from disk, interpret findings, and generate reports.
 
-2. **No prose-based data flow reasoning.** Do NOT trace taint paths, reachability, or
-   def-use chains by reading code and reasoning narratively. Instead:
-   - Write a custom Datalog query that encodes the property you want to check
-   - Run it via `tool_run_souffle(custom_rules=...)`
-   - Report what the query produces (or doesn't produce)
+Analysis results: {analysis_summary}
+Extraction info: {extraction_summary}
+Key findings: {key_findings}
 
-3. **Cross-check every finding.** Before finalizing a finding, write a verification query
-   that checks whether guards, sanitizers, or contradictions invalidate it. Specifically:
-   - If you claim "X flows to Y", there must be a `TaintedVar` or `DefReachesUse` tuple
-   - If you claim "no guard protects this", there must be no `GuardedSink` tuple
-   - If you claim "integer overflow at line N", compose the `Guard` facts at that point
-     to check whether preconditions are actually reachable
+## Tools available
+- `tool_read_file(path)` — Read output CSVs, fact files, rule files
+- `tool_save_report(content, target_name)` — Save Markdown report (only when user asks)
+- `tool_list_datalog_files()` — List available files
 
-4. **When in doubt, query.** If you're unsure whether a property holds, the answer is
-   always to write a Datalog query — never to reason about it in prose. A 3-line custom
-   query that returns empty is more trustworthy than a paragraph of plausible reasoning.
+## How to interpret results
+1. Read output/*.csv files (e.g., TaintedSink.csv, UseAfterFree.csv, MemSafetyFinding.csv)
+2. Cross-reference with fact files to trace vulnerability paths
+3. Every finding must cite the Datalog relation that produced it
 
-5. **Distinguish Datalog-derived vs. observations.** When you do make an observation from
-   reading code (e.g., "this function uses malloc"), clearly label it as an observation
-   and state that formal verification requires running a query. Never present observations
-   as verified findings.
-
-### Why this matters:
-
-The LLM is good at pattern-matching and generating plausible narratives. It is NOT reliable
-for formal reasoning about program properties — that's exactly why we have Datalog. If you
-bypass Datalog and reason in prose, you will produce findings that sound correct but may be
-wrong (e.g., missing a guard that blocks a taint path). The whole point of this tool is that
-Datalog catches what prose reasoning misses.
+## Report structure (when asked to save/generate a report)
+1. **Executive Summary** — one-paragraph overview
+2. **Issues Found** — vulnerability type, location (file:line), severity
+3. **Root Cause Analysis** — confirmed/ruled out, citing Datalog evidence
+4. **Reachability** — file-level or project-level scope
+5. **Exploitability Assessment** — why/how exploitable, input structure, entry points
+6. **CVE Cross-Reference** — known CVE matches or "potential novel finding"
+7. **Datalog Evidence** — key queries and raw output
+8. **Recommendations** — prioritized remediation steps
 
 ## Response style
-
 - Be concise. Lead with findings, not process.
-- When showing taint paths, trace from source to sink with variable names and line numbers.
-- Every finding must cite the Datalog query or relation that produced it.
+- Trace taint paths from source to sink with variable names and line numbers.
 - Flag vulnerability type and severity.
-- When asked about a function, extract and analyze it before answering.
+"""
+
+CVE_INSTRUCTION = """You are the **CVE Agent** for SourceCodeQL.
+You search the NIST NVD database to check if discovered vulnerabilities match known CVEs.
+
+Findings to cross-reference: {key_findings}
+
+## Tools available
+- `tool_search_cve(keyword, max_results)` — Search NVD
+
+## How to search
+- After a finding: search by software name + vulnerability type (e.g., "cJSON buffer overflow")
+- By CWE: search "CWE-416 use-after-free" for broader matches
+- By CVE ID: direct lookup if user provides one
+- Summarize: CVE ID, severity, description, whether it matches the finding
+
+Transfer back to coordinator when done.
 """
 
 
 # =============================================================================
-# Build and register the root agent
+# Context window safety net — trim conversation if still too large
+# =============================================================================
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "400000"))  # ~100K tokens
+MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "2000"))
+
+
+def _trim_context(callback_context, llm_request):
+    """Before-model callback: trim conversation to fit context window."""
+    contents = llm_request.contents
+    if not contents:
+        return None
+
+    total_chars = sum(
+        sum(len(str(p.text or "")) + len(str(getattr(p, "function_response", None) or ""))
+            for p in c.parts or [])
+        for c in contents
+    )
+
+    if total_chars <= MAX_CONTEXT_CHARS:
+        return None
+
+    # Phase 1: Truncate large tool results in-place
+    for content in contents:
+        if not content.parts:
+            continue
+        for part in content.parts:
+            fr = getattr(part, "function_response", None)
+            if fr and fr.response:
+                resp_str = str(fr.response)
+                if len(resp_str) > MAX_TOOL_RESULT_CHARS:
+                    name = fr.name if hasattr(fr, "name") else "tool"
+                    summary = resp_str[:MAX_TOOL_RESULT_CHARS // 2]
+                    summary += f"\n... [truncated {len(resp_str)} chars from {name}] ...\n"
+                    summary += resp_str[-500:]
+                    fr.response = {"_truncated": True, "summary": summary}
+
+    # Recompute
+    total_chars = sum(
+        sum(len(str(p.text or "")) + len(str(getattr(p, "function_response", None) or ""))
+            for p in c.parts or [])
+        for c in contents
+    )
+
+    # Phase 2: Drop old turns if still too large
+    if total_chars > MAX_CONTEXT_CHARS:
+        model_turns = [i for i, c in enumerate(contents) if c.role == "model"]
+        if len(model_turns) > 3:
+            split = model_turns[-3]
+            while split > 0 and contents[split - 1].role == "user":
+                split -= 1
+            # Avoid orphaning tool_result blocks whose tool_use was dropped.
+            # Walk split left until all function_response IDs have matching
+            # function_call IDs in the kept portion.
+            split = _adjust_split_for_tool_pairs(contents, split)
+            llm_request.contents = contents[split:]
+
+    return None
+
+
+def _adjust_split_for_tool_pairs(contents, split_index: int) -> int:
+    """Move split_index left until no tool_result is orphaned from its tool_use."""
+    needed_call_ids = set()
+    for i in range(len(contents) - 1, -1, -1):
+        parts = contents[i].parts or []
+        for part in reversed(parts):
+            fr = getattr(part, "function_response", None)
+            if fr and getattr(fr, "id", None):
+                needed_call_ids.add(fr.id)
+            fc = getattr(part, "function_call", None)
+            if fc and getattr(fc, "id", None):
+                needed_call_ids.discard(fc.id)
+        if i <= split_index and not needed_call_ids:
+            return i
+    return 0
+
+
+# =============================================================================
+# Build sub-agents
+# =============================================================================
+extraction_agent = LlmAgent(
+    name="ExtractionAgent",
+    model=create_model(lite=True),
+    instruction=EXTRACTION_INSTRUCTION,
+    include_contents="none",
+    output_key="extraction_summary",
+    tools=[
+        FunctionTool(tool_extract_facts_llm),
+        FunctionTool(tool_extract_slice),
+        FunctionTool(tool_validate_extraction),
+        FunctionTool(tool_extraction_metrics),
+    ],
+)
+
+analysis_agent = LlmAgent(
+    name="AnalysisAgent",
+    model=create_model(),
+    instruction=ANALYSIS_INSTRUCTION,
+    include_contents="none",
+    output_key="analysis_summary",
+    tools=[
+        FunctionTool(tool_run_souffle),
+        FunctionTool(tool_run_taint_pipeline),
+        FunctionTool(tool_generate_annotations),
+        FunctionTool(tool_generate_signatures),
+        FunctionTool(tool_set_entry_taint),
+        FunctionTool(tool_read_file),
+    ],
+)
+
+interpreter_agent = LlmAgent(
+    name="InterpreterAgent",
+    model=create_model(),
+    instruction=INTERPRETER_INSTRUCTION,
+    include_contents="none",
+    output_key="interpretation",
+    tools=[
+        FunctionTool(tool_read_file),
+        FunctionTool(tool_save_report),
+        FunctionTool(tool_list_datalog_files),
+    ],
+)
+
+cve_agent = LlmAgent(
+    name="CVEAgent",
+    model=create_model(lite=True),
+    instruction=CVE_INSTRUCTION,
+    include_contents="none",
+    output_key="cve_results",
+    tools=[
+        FunctionTool(tool_search_cve),
+    ],
+)
+
+
+# =============================================================================
+# Build and register the root agent (coordinator)
 # =============================================================================
 root_agent = LlmAgent(
     name="SourceCodeQL",
     model=create_model(),
-    instruction=AGENT_INSTRUCTION,
+    instruction=COORDINATOR_INSTRUCTION,
+    before_model_callback=_trim_context,
+    sub_agents=[extraction_agent, analysis_agent, interpreter_agent, cve_agent],
     tools=[
-        FunctionTool(tool_clean_workspace),
+        FunctionTool(tool_run_full_pipeline),
         FunctionTool(tool_scan_project),
         FunctionTool(tool_build_slice),
+        FunctionTool(tool_clean_workspace),
         FunctionTool(tool_read_source),
-        FunctionTool(tool_extract_facts_llm),
-        FunctionTool(tool_extract_slice),
-        FunctionTool(tool_run_souffle),
-        FunctionTool(tool_run_taint_pipeline),
         FunctionTool(tool_list_datalog_files),
         FunctionTool(tool_read_file),
-        FunctionTool(tool_generate_annotations),
-        FunctionTool(tool_generate_signatures),
-        FunctionTool(tool_set_entry_taint),
-        FunctionTool(tool_validate_extraction),
-        FunctionTool(tool_extraction_metrics),
     ],
 )

@@ -91,15 +91,25 @@ def run_souffle(
             os.unlink(rule_path)
 
     # Collect outputs
+    # Cap content returned to caller to prevent ADK context overflow.
+    # Full results remain on disk in output/*.csv.
+    MAX_OUTPUT_LINES = int(os.environ.get("MAX_SOUFFLE_OUTPUT_LINES", "50"))
+
     outputs = {}
+    stats = {}
     for csv_file in sorted(output_dir.glob("*.csv")):
         content = csv_file.read_text().strip()
         if content:
-            outputs[csv_file.name] = content
-
-    stats = {}
-    for name, content in outputs.items():
-        stats[name] = len(content.split('\n'))
+            lines = content.split('\n')
+            stats[csv_file.name] = len(lines)
+            if len(lines) > MAX_OUTPUT_LINES:
+                truncated = '\n'.join(lines[:MAX_OUTPUT_LINES])
+                outputs[csv_file.name] = (
+                    f"{truncated}\n... ({len(lines) - MAX_OUTPUT_LINES} more rows, "
+                    f"see {csv_file} for full output)"
+                )
+            else:
+                outputs[csv_file.name] = content
 
     success = result.returncode == 0
 

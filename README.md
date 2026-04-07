@@ -132,7 +132,33 @@ Then open the browser at `http://localhost:8000` and select the **SourceCodeQL**
 > "Extract facts for parse_string in cJSON.c"
 > "Run the taint pipeline and show me the findings"
 
-The agent has access to all pipeline tools: project scanning, backward slicing, LLM fact extraction (with automatic batch API routing for large jobs), Souffle execution, annotation generation, and result inspection.
+The agent uses a **multi-agent coordinator architecture** designed for large projects:
+
+- **Coordinator** — routes requests, runs the full pipeline tool
+- **ExtractionAgent** — LLM fact extraction (uses `LITE_MODEL_NAME` for cost efficiency)
+- **AnalysisAgent** — Souffle Datalog queries and custom rule composition
+- **InterpreterAgent** — reads results, interprets findings, generates reports
+- **CVEAgent** — searches NIST NVD for known CVEs matching findings (uses `LITE_MODEL_NAME`)
+
+For large projects, use `tool_run_full_pipeline(project_dir)` — it runs the entire scan-extract-analyze pipeline as pure computation and returns only a compact summary, avoiding context window overflow.
+
+#### Cost Optimization
+
+By default, all agents use `MODEL_NAME`. For significant cost savings, set `LITE_MODEL_NAME` in `.env` to use a cheaper model for sub-agents that don't need deep reasoning:
+
+```bash
+# In .env
+MODEL_NAME="anthropic/claude-opus-4-6"          # For analysis & interpretation
+LITE_MODEL_NAME="anthropic/claude-sonnet-4-6"    # For extraction routing & CVE lookup (~10x cheaper)
+```
+
+| Agent | Model Used | Why |
+|-------|-----------|-----|
+| Coordinator | `MODEL_NAME` | Needs to understand user intent and route |
+| ExtractionAgent | `LITE_MODEL_NAME` | Orchestrates extraction calls, no deep reasoning |
+| AnalysisAgent | `MODEL_NAME` | Composes Datalog queries, interprets formal results |
+| InterpreterAgent | `MODEL_NAME` | Deep reasoning for vulnerability assessment |
+| CVEAgent | `LITE_MODEL_NAME` | Calls NVD API and formats results |
 
 ### Command-Line Mode
 
