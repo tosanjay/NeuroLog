@@ -297,7 +297,7 @@ def _load_env():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, val = line.partition("=")
-                os.environ.setdefault(key.strip(), val.strip().strip('"'))
+                os.environ[key.strip()] = val.strip().strip('"')
 
 
 if __name__ == "__main__":

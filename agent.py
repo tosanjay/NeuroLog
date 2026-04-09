@@ -100,6 +100,68 @@ def create_model(lite: bool = False):
 
 
 # =============================================================================
+# Extraction cache — avoid redundant LLM calls for the same project
+# =============================================================================
+import json
+from datetime import datetime, timezone
+
+EXTRACTION_META = FACTS_DIR / ".extraction_meta.json"
+
+
+def _write_extraction_meta(project_dir: str, functions: list[str],
+                           fact_kinds: list[str]):
+    """Write metadata about the current extraction to facts/."""
+    meta = {
+        "project_dir": str(Path(project_dir).resolve()),
+        "functions": sorted(functions),
+        "fact_kinds": sorted(fact_kinds),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": MODEL_NAME,
+    }
+    FACTS_DIR.mkdir(parents=True, exist_ok=True)
+    EXTRACTION_META.write_text(json.dumps(meta, indent=2))
+
+
+def _read_extraction_meta() -> dict | None:
+    """Read cached extraction metadata, or None if not present."""
+    if EXTRACTION_META.exists():
+        try:
+            return json.loads(EXTRACTION_META.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
+
+
+def _extraction_cache_valid(project_dir: str, functions: list[str]) -> tuple[bool, str]:
+    """Check if cached extraction matches the requested project+functions.
+
+    Returns (is_valid, reason_string).
+    """
+    meta = _read_extraction_meta()
+    if meta is None:
+        return False, "no cached extraction found"
+
+    cached_path = meta.get("project_dir", "")
+    requested_path = str(Path(project_dir).resolve())
+    if cached_path != requested_path:
+        return False, f"different project (cached: {Path(cached_path).name}, requested: {Path(requested_path).name})"
+
+    cached_funcs = set(meta.get("functions", []))
+    requested_funcs = set(functions)
+    missing = requested_funcs - cached_funcs
+    if missing:
+        return False, f"{len(missing)} new functions not in cache: {sorted(missing)[:5]}"
+
+    # Check that .facts files actually exist on disk
+    fact_files = list(FACTS_DIR.glob("*.facts"))
+    if len(fact_files) < 3:
+        return False, f"only {len(fact_files)} .facts files on disk (corrupted cache?)"
+
+    ts = meta.get("timestamp", "unknown")
+    return True, f"cache valid (extracted {ts}, {len(cached_funcs)} functions, {len(fact_files)} fact files)"
+
+
+# =============================================================================
 # Tool: Clean workspace
 # =============================================================================
 def tool_clean_workspace(
@@ -123,6 +185,9 @@ def tool_clean_workspace(
         for f in FACTS_DIR.glob("*.facts"):
             f.unlink()
             removed["facts"] += 1
+        # Also clear extraction metadata when facts are cleaned
+        if EXTRACTION_META.exists():
+            EXTRACTION_META.unlink()
     if clean_output:
         for f in OUTPUT_DIR.glob("*.csv"):
             f.unlink()
@@ -1180,6 +1245,7 @@ def tool_run_full_pipeline(
     extensions: str = ".c",
     skip_scan: bool = False,
     skip_extract: bool = False,
+    force_extract: bool = False,
     tool_context: ToolContext = None,
 ) -> dict:
     """Run the complete analysis pipeline: scan → slice → extract → analyze.
@@ -1198,6 +1264,7 @@ def tool_run_full_pipeline(
         extensions: Comma-separated file extensions (default: ".c").
         skip_scan: Skip the scan phase (use if already scanned).
         skip_extract: Skip extraction (use if facts already exist on disk).
+        force_extract: Force re-extraction even if cache is valid.
         tool_context: ADK-injected context for session state persistence.
 
     Returns:
@@ -1236,23 +1303,44 @@ def tool_run_full_pipeline(
 
     summary["phases"]["targets"] = {"count": len(targets), "names": targets[:20]}
 
-    # Phase 3: Clean + Extract
+    # Phase 3: Clean + Extract (with cache awareness)
     if not skip_extract:
-        print(f"  [pipeline] Phase 3: Extracting facts for {len(targets)} functions...")
-        tool_clean_workspace()
-        try:
-            extract_result = tool_extract_slice(
-                project_dir, function_names=targets, extensions=extensions)
+        cache_valid, cache_reason = _extraction_cache_valid(project_dir, targets)
+        if cache_valid and not force_extract:
+            print(f"  [pipeline] Phase 3: SKIPPED — {cache_reason}")
+            meta = _read_extraction_meta()
+            fact_count = len(list(FACTS_DIR.glob("*.facts")))
             summary["phases"]["extract"] = {
-                "mode": extract_result.get("extraction_mode", "unknown"),
-                "functions_extracted": extract_result.get("functions_extracted", 0),
-                "total_facts": extract_result.get("total_facts", 0),
-                "total_on_disk": extract_result.get("total_on_disk", 0),
+                "mode": "cached",
+                "functions_extracted": len(meta.get("functions", [])),
+                "total_on_disk": fact_count,
+                "cache_reason": cache_reason,
             }
-            if extract_result.get("warning"):
-                errors.append(extract_result["warning"])
-        except Exception as e:
-            errors.append(f"extract: {e}")
+            # Clear output/ for fresh Souffle run (facts/ are preserved)
+            for f in OUTPUT_DIR.glob("*.csv"):
+                f.unlink()
+        else:
+            if force_extract and cache_valid:
+                print(f"  [pipeline] Phase 3: Force re-extracting ({cache_reason} but force_extract=True)")
+            else:
+                print(f"  [pipeline] Phase 3: Extracting facts for {len(targets)} functions ({cache_reason})")
+            tool_clean_workspace()
+            try:
+                extract_result = tool_extract_slice(
+                    project_dir, function_names=targets, extensions=extensions)
+                summary["phases"]["extract"] = {
+                    "mode": extract_result.get("extraction_mode", "unknown"),
+                    "functions_extracted": extract_result.get("functions_extracted", 0),
+                    "total_facts": extract_result.get("total_facts", 0),
+                    "total_on_disk": extract_result.get("total_on_disk", 0),
+                }
+                if extract_result.get("warning"):
+                    errors.append(extract_result["warning"])
+                # Write extraction metadata for future cache hits
+                fact_kinds = [f.stem for f in FACTS_DIR.glob("*.facts")]
+                _write_extraction_meta(project_dir, targets, fact_kinds)
+            except Exception as e:
+                errors.append(f"extract: {e}")
 
     # Phase 4: Annotations + Signatures
     print("  [pipeline] Phase 4: Generating annotations and signatures...")
@@ -1446,20 +1534,81 @@ Key findings: {key_findings}
 2. Cross-reference with fact files to trace vulnerability paths
 3. Every finding must cite the Datalog relation that produced it
 
+## CRITICAL: Grounded cross-finding pattern analysis
+
+**Datalog surfaces evidence. Your job is to connect the dots — but ONLY dots that exist.**
+
+You MUST base ALL reasoning on Datalog-derived facts and findings. You may reason
+ACROSS multiple findings to identify compound patterns, but every step in your
+reasoning chain must be anchored to a specific Datalog relation, tuple, or fact file
+entry. Never invent data flow paths, taint relationships, or variable states that
+are not present in the output CSVs or fact files.
+
+### What you CAN do (grounded reasoning):
+- Combine findings from DIFFERENT Datalog relations that share the same function,
+  variable, or line number — the combination is your insight, the ingredients are Datalog's.
+- Infer higher-level vulnerability semantics (e.g., "this truncation + this unbounded
+  counter = sentinel collision risk") when each component is backed by a specific tuple.
+- Assess exploitability and severity based on the evidence.
+- Read source code to CONFIRM a pattern suggested by Datalog evidence.
+
+### What you MUST NOT do:
+- Claim a variable is tainted unless TaintedVar/TaintedField contains it.
+- Claim a data flow path exists unless DefReachesUse/CFGReach supports it.
+- Claim a function is called unless Call.facts contains the edge.
+- Invent guards, sanitizers, or mitigations not in Guard.facts/SanitizedVar.
+- Speculate about vulnerabilities with zero Datalog evidence.
+
+### How to do cross-finding analysis:
+
+1. **Cluster findings by location.** Group findings sharing the same function or
+   variables/struct fields. Co-located findings are far more likely to form a real
+   vulnerability chain than isolated ones.
+
+2. **Look for compound patterns.** When you see multiple findings in the same area,
+   ask: "Do these combine into something worse?" Examples (each component must
+   exist as a Datalog tuple):
+   - ImplicitTruncation + UnboundedCounter → value-space exhaustion / sentinel collision
+   - TaintedImplicitTruncation + TaintControlledSink(memset) → attacker-controlled
+     truncation at initialization site
+   - UnguardedTaintedSink + missing Guard on a related variable → no bounds check
+     on the full attack path
+   - TaintedPtrArith + BufferOverflowInLoop → indexed OOB write in a loop
+   - UncheckedAlloc + TaintedSizeAtSink → allocator failure leading to NULL deref
+
+3. **Reason about what Datalog CANNOT express — but ground the premise.**
+   Datalog tracks data flow and types but cannot reason about numeric ranges,
+   domain semantics, or protocol state. When Datalog evidence HINTS at these
+   patterns (e.g., an UnboundedCounter exists for a variable that is also in an
+   ImplicitTruncation), you may use domain knowledge to assess the implication.
+   Always: (a) cite the specific Datalog tuples that form the premise, then
+   (b) clearly label the inference as "LLM-inferred (not Datalog-derived)."
+
+4. **Read source code to CONFIRM, not to discover.** Use tool_read_file only to
+   verify a pattern already suggested by Datalog evidence, not to find new
+   vulnerabilities from scratch.
+
+5. **Prioritize compound findings.** A single TaintedSink is medium-signal.
+   Three co-located findings forming a chain is high-signal. Rank accordingly.
+
 ## Report structure (when asked to save/generate a report)
 1. **Executive Summary** — one-paragraph overview
-2. **Issues Found** — vulnerability type, location (file:line), severity
-3. **Root Cause Analysis** — confirmed/ruled out, citing Datalog evidence
-4. **Reachability** — file-level or project-level scope
-5. **Exploitability Assessment** — why/how exploitable, input structure, entry points
-6. **CVE Cross-Reference** — known CVE matches or "potential novel finding"
-7. **Datalog Evidence** — key queries and raw output
-8. **Recommendations** — prioritized remediation steps
+2. **Critical Compound Findings** — multi-finding chains, highest priority
+3. **Individual Findings** — single-relation findings by severity
+4. **Root Cause Analysis** — confirmed/ruled out, citing Datalog evidence
+5. **Reachability** — file-level or project-level scope
+6. **Exploitability Assessment** — why/how exploitable, input structure, entry points
+7. **CVE Cross-Reference** — known CVE matches or "potential novel finding"
+8. **Datalog Evidence** — key queries and raw output
+9. **LLM-Inferred Patterns** — compound patterns with reasoning (clearly labeled)
+10. **Recommendations** — prioritized remediation steps
 
 ## Response style
 - Be concise. Lead with findings, not process.
 - Trace taint paths from source to sink with variable names and line numbers.
 - Flag vulnerability type and severity.
+- When reporting compound findings, show the individual Datalog evidence first,
+  then your reasoning about how they combine.
 """
 
 CVE_INSTRUCTION = """You are the **CVE Agent** for SourceCodeQL.

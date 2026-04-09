@@ -183,20 +183,36 @@ TaintSourceFunc("fscanf").
 TaintSourceFunc("getline").
 
 .decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
-DangerousSink("memcpy",  2, "buffer_overflow").
-DangerousSink("memcpy",  1, "buffer_overflow").
-DangerousSink("memmove", 2, "buffer_overflow").
-DangerousSink("memset",  2, "buffer_overflow").
+// Buffer copy/set — destination and size args
+DangerousSink("memcpy",  0, "buffer_overflow").  // dst buffer
+DangerousSink("memcpy",  2, "buffer_overflow").  // size
+DangerousSink("memmove", 0, "buffer_overflow").  // dst buffer
+DangerousSink("memmove", 2, "buffer_overflow").  // size
+DangerousSink("memset",  0, "buffer_overflow").  // dst buffer
+DangerousSink("memset",  2, "buffer_overflow").  // size
 DangerousSink("strcpy",  1, "buffer_overflow").
 DangerousSink("strncpy", 2, "buffer_overflow").
-DangerousSink("sprintf", 1, "format_string").   // fmt arg (user-controlled format)
-DangerousSink("snprintf",2, "format_string").   // fmt arg
-DangerousSink("system",  0, "command_injection").
-DangerousSink("free",    0, "double_free").
 DangerousSink("strcat",  1, "buffer_overflow").
 DangerousSink("strncat", 1, "buffer_overflow").
-DangerousSink("printf",  0, "format_string").   // fmt arg — ONLY arg0 is dangerous
-DangerousSink("fprintf", 1, "format_string").   // fmt arg
+// I/O — destination buffer args
+DangerousSink("read",    1, "buffer_overflow").  // read(fd, buf, count)
+DangerousSink("recv",    1, "buffer_overflow").  // recv(fd, buf, len, flags)
+DangerousSink("recvfrom",1, "buffer_overflow").
+DangerousSink("fread",   0, "buffer_overflow").  // fread(buf, size, count, stream)
+DangerousSink("fgets",   0, "buffer_overflow").  // fgets(buf, size, stream)
+DangerousSink("gets",    0, "buffer_overflow").  // gets(buf) — always dangerous
+// Format string
+DangerousSink("sprintf", 1, "format_string").    // fmt arg
+DangerousSink("snprintf",2, "format_string").    // fmt arg
+DangerousSink("printf",  0, "format_string").    // fmt arg
+DangerousSink("fprintf", 1, "format_string").    // fmt arg
+DangerousSink("syslog",  1, "format_string").    // syslog(priority, fmt, ...)
+// Command injection
+DangerousSink("system",  0, "command_injection").
+DangerousSink("popen",   0, "command_injection").
+DangerousSink("execve",  0, "command_injection").
+// Memory management
+DangerousSink("free",    0, "double_free").
 DangerousSink("malloc",  0, "heap_overflow").
 DangerousSink("calloc",  0, "heap_overflow").
 DangerousSink("calloc",  1, "heap_overflow").

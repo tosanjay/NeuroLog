@@ -484,7 +484,7 @@ if __name__ == "__main__":
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, val = line.partition("=")
-                os.environ.setdefault(key.strip(), val.strip().strip('"'))
+                os.environ[key.strip()] = val.strip().strip('"')
 
     file_path = sys.argv[1]
     func_name = sys.argv[2]

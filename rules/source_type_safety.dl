@@ -62,15 +62,38 @@
 .input DefReachesUse
 
 .decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
+// Buffer copy/set — destination and size args
+DangerousSink("memcpy",  0, "buffer_overflow").
 DangerousSink("memcpy",  2, "buffer_overflow").
-DangerousSink("memcpy",  1, "buffer_overflow").
+DangerousSink("memmove", 0, "buffer_overflow").
 DangerousSink("memmove", 2, "buffer_overflow").
+DangerousSink("memset",  0, "buffer_overflow").
 DangerousSink("memset",  2, "buffer_overflow").
 DangerousSink("strcpy",  1, "buffer_overflow").
 DangerousSink("strncpy", 2, "buffer_overflow").
-DangerousSink("sprintf", 2, "format_string").
+DangerousSink("strcat",  1, "buffer_overflow").
+DangerousSink("strncat", 1, "buffer_overflow").
+// I/O — destination buffer args
+DangerousSink("read",    1, "buffer_overflow").
+DangerousSink("recv",    1, "buffer_overflow").
+DangerousSink("recvfrom",1, "buffer_overflow").
+DangerousSink("fread",   0, "buffer_overflow").
+DangerousSink("fgets",   0, "buffer_overflow").
+DangerousSink("gets",    0, "buffer_overflow").
+// Format string
+DangerousSink("sprintf", 1, "format_string").
+DangerousSink("snprintf",2, "format_string").
+DangerousSink("printf",  0, "format_string").
+DangerousSink("fprintf", 1, "format_string").
+DangerousSink("syslog",  1, "format_string").
+// Command injection
+DangerousSink("system",  0, "command_injection").
+DangerousSink("popen",   0, "command_injection").
+DangerousSink("execve",  0, "command_injection").
+// Allocation size
 DangerousSink("malloc",  0, "allocation_size").
 DangerousSink("calloc",  0, "allocation_size").
+DangerousSink("calloc",  1, "allocation_size").
 DangerousSink("realloc", 1, "allocation_size").
 DangerousSink("alloca",  0, "allocation_size").
 
@@ -302,8 +325,77 @@ UnguardedDangerousCast(f, a, src, dst, "sign_extend", st, dt, sw, dw) :-
 .output UnguardedDangerousCast
 
 // ════════════════════════════════════════════════════════════════════
-// RULE 8: INTEGER OVERFLOW IN NARROW ARITHMETIC BEFORE SINK
+// RULE 8: IMPLICIT TRUNCATION — wider value assigned to narrower storage
 // ════════════════════════════════════════════════════════════════════
+// Catches width mismatches that happen WITHOUT an explicit C cast:
+//   int32 counter written to uint16_t array element
+//   size_t value assigned to int variable
+// These are invisible to TruncationCast (which requires a Cast fact).
+
+.decl ImplicitTruncation(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                         src_width: number, dst_width: number,
+                         src_type: Sym, dst_type: Sym)
+
+ImplicitTruncation(f, a, src, dst, sw, dw, st, dt) :-
+    Def(f, dst, _, a),
+    Use(f, src, _, a),
+    src != dst,
+    ResolvedVarType(f, src, st, _, sw, _),
+    ResolvedVarType(f, dst, dt, _, dw, _),
+    sw > dw,
+    sw > 0, dw > 0,
+    !Cast(f, a, _, _, _, _, _, _, _, _, _).
+
+.output ImplicitTruncation
+
+// Tainted implicit truncation — attacker controls the wider value
+.decl TaintedImplicitTruncation(func: Sym, addr: Addr, src: Sym, dst: Sym,
+                                src_width: number, dst_width: number,
+                                src_type: Sym, dst_type: Sym, origin: Sym)
+
+TaintedImplicitTruncation(f, a, src, dst, sw, dw, st, dt, origin) :-
+    ImplicitTruncation(f, a, src, dst, sw, dw, st, dt),
+    TaintedVar(f, src, src_def, origin, _),
+    DefReachesUse(f, src, src_def, a).
+
+.output TaintedImplicitTruncation
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 9: UNBOUNDED COUNTER — increment without upper bound guard
+// ════════════════════════════════════════════════════════════════════
+// A variable is incremented (add) but never checked against an upper
+// bound anywhere in the function. When combined with a narrower storage
+// destination, the counter can wrap or collide with sentinel values.
+
+.decl HasUpperBound(func: Sym, var: Sym)
+HasUpperBound(f, v) :- Guard(f, _, v, _, "<", _, _).
+HasUpperBound(f, v) :- Guard(f, _, v, _, "<=", _, _).
+HasUpperBound(f, v) :- Guard(f, _, v, _, "lt", _, _).
+HasUpperBound(f, v) :- Guard(f, _, v, _, "le", _, _).
+HasUpperBound(f, v) :- Guard(f, _, v, _, "unsigned_lt", _, _).
+HasUpperBound(f, v) :- Guard(f, _, v, _, "unsigned_le", _, _).
+
+.decl UnboundedCounter(func: Sym, var: Sym, incr_addr: Addr)
+
+UnboundedCounter(f, v, a) :-
+    ArithOp(f, a, v, _, "add", _, _, _),
+    !HasUpperBound(f, v).
+
+.output UnboundedCounter
+
+// Tainted unbounded counter — attacker controls iteration count
+.decl TaintedUnboundedCounter(func: Sym, var: Sym, incr_addr: Addr, origin: Sym)
+
+TaintedUnboundedCounter(f, v, a, origin) :-
+    UnboundedCounter(f, v, a),
+    TaintedVar(f, v, v_def, origin, _),
+    DefReachesUse(f, v, v_def, a).
+
+.output TaintedUnboundedCounter
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 10: INTEGER OVERFLOW IN NARROW ARITHMETIC BEFORE SINK
+// ═════════════════════════════════════════════════════════════════════
 
 .decl NarrowArithAtSink(func: Sym, call_addr: Addr, callee: Sym,
                         arith_var: Sym, arith_addr: Addr, width: number,
@@ -322,7 +414,7 @@ NarrowArithAtSink(f, ca, callee, dst, arith_a, w, sign, risk) :-
 .output NarrowArithAtSink
 
 // ════════════════════════════════════════════════════════════════════
-// RULE 9: TAINTED NARROW ARITHMETIC — exploitable integer overflow
+// RULE 11: TAINTED NARROW ARITHMETIC — exploitable integer overflow
 // ════════════════════════════════════════════════════════════════════
 
 .decl TaintedNarrowArith(func: Sym, call_addr: Addr, callee: Sym,
@@ -379,5 +471,21 @@ TypeSafetyFinding(f, ca, "tainted_narrow_arith", v,
 TypeSafetyFinding(f, a, "signedness_mismatch", src,
     cat(st, cat("(", cat(ss, cat(")→", cat(dt, cat("(", cat(ds, ")")))))))) :-
     SignednessMismatch(f, a, src, _, ss, ds, st, dt).
+
+TypeSafetyFinding(f, a, "implicit_truncation", src,
+    cat(st, cat("(", cat(to_string(sw), cat("B)→", cat(dt, cat("(", cat(to_string(dw), "B)")))))))) :-
+    ImplicitTruncation(f, a, src, _, sw, dw, st, dt).
+
+TypeSafetyFinding(f, a, "tainted_implicit_truncation", src,
+    cat(st, cat("(", cat(to_string(sw), cat("B)→", cat(dt, cat("(", cat(to_string(dw), cat("B) origin=", origin))))))))) :-
+    TaintedImplicitTruncation(f, a, src, _, sw, dw, st, dt, origin).
+
+TypeSafetyFinding(f, a, "unbounded_counter", v,
+    cat("incremented at ", to_string(a))) :-
+    UnboundedCounter(f, v, a).
+
+TypeSafetyFinding(f, a, "tainted_unbounded_counter", v,
+    cat("incremented at ", cat(to_string(a), cat(" origin=", origin)))) :-
+    TaintedUnboundedCounter(f, v, a, origin).
 
 .output TypeSafetyFinding

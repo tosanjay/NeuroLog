@@ -151,6 +151,8 @@ def _recycle_outputs_to_facts(output_dir: Path, facts_dir: Path):
         "UncheckedAlloc",
         "UseAfterFree", "UnguardedUAF",
         "DoubleFree", "UnguardedDoubleFree",
+        "ImplicitTruncation", "TaintedImplicitTruncation",
+        "UnboundedCounter", "TaintedUnboundedCounter",
     ]
     copied = []
     for name in RECYCLE:
