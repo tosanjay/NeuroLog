@@ -78,6 +78,14 @@
 CFGReach(f, a, b) :- CFGEdge(f, a, b).
 CFGReach(f, a, c) :- CFGReach(f, a, b), CFGEdge(f, b, c).
 
+// ── Helper: Reachability-aware guard check ────────────────────────
+// A guard is "effective" for a use site only if the guard precedes
+// the use site on some CFG path (not just anywhere in the function).
+.decl EffectiveGuard(func: Sym, guard_addr: Addr, use_addr: Addr, var: Sym)
+EffectiveGuard(f, ga, ua, v) :-
+    Guard(f, ga, v, _, _, _, _),
+    CFGReach(f, ga, ua).
+
 // ── Helper: size-sensitive sinks ───────────────────────────────────
 .decl SizeSensitiveSink(func: Sym, arg_idx: Idx)
 SizeSensitiveSink("malloc",  0).
@@ -171,7 +179,7 @@ TaintedPtrArith(f, aa, dst, src, "index_scale", origin) :-
 
 UnguardedTaintedPtrArith(f, aa, ptr, offset, op, origin) :-
     TaintedPtrArith(f, aa, ptr, offset, op, origin),
-    !Guard(f, _, offset, _, _, _, _).
+    !EffectiveGuard(f, _, aa, offset).
 
 .output UnguardedTaintedPtrArith
 
@@ -341,16 +349,21 @@ AllocThenUnboundedCopy(f, aa, ca, buf, asz, af, callee, origin) :-
 .decl UncheckedAlloc(func: Sym, alloc_addr: Addr, buf_var: Sym,
                      use_addr: Addr, alloc_func: Sym)
 
+// Helper: NULL-check guard that precedes a use site on the CFG
+.decl EffectiveNullGuard(func: Sym, guard_addr: Addr, use_addr: Addr, var: Sym)
+EffectiveNullGuard(f, ga, ua, v) :-
+    Guard(f, ga, v, _, op, bound, _),
+    (op = "ne" ; op = "eq"),
+    (bound = "NULL" ; bound = "0"),
+    CFGReach(f, ga, ua).
+
 UncheckedAlloc(f, aa, buf, use_a, af) :-
     AllocSite(f, aa, buf, _, af),
     DefReachesUse(f, buf, aa, use_a),
     Use(f, buf, _, use_a),
     use_a != aa,
-    // No NULL check between alloc and use
-    !Guard(f, _, buf, _, "ne", "NULL", _),
-    !Guard(f, _, buf, _, "ne", "0", _),
-    !Guard(f, _, buf, _, "eq", "NULL", _),
-    !Guard(f, _, buf, _, "eq", "0", _).
+    // No NULL check between alloc and use on any CFG path
+    !EffectiveNullGuard(f, _, use_a, buf).
 
 .output UncheckedAlloc
 
@@ -385,7 +398,7 @@ TaintedSizeAtSink(f, ca, callee, sv, 0, origin) :-
 
 UnguardedTaintedSize(f, ca, callee, sv, idx, origin) :-
     TaintedSizeAtSink(f, ca, callee, sv, idx, origin),
-    !Guard(f, _, sv, _, _, _, _).
+    !EffectiveGuard(f, _, ca, sv).
 
 .output UnguardedTaintedSize
 

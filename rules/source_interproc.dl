@@ -649,22 +649,39 @@ TaintControlledSink(func, callee, ca, 0, gv, risk, origin) :-
 // ════════════════════════════════════════════════════════════════════
 // Global variables are accessed across functions without being passed
 // as parameters. Infer globals heuristically: a variable used (or
-// defined) in multiple functions without being a formal parameter.
+// defined) in 3+ functions without being a formal parameter.
+// CommonLocal blocklist prevents frequent local names (i, len, buf...)
+// from being falsely promoted to globals.
+
+.decl CommonLocal(v: Sym)
+CommonLocal("i"). CommonLocal("j"). CommonLocal("k"). CommonLocal("n").
+CommonLocal("p"). CommonLocal("s"). CommonLocal("c"). CommonLocal("x").
+CommonLocal("ret"). CommonLocal("err"). CommonLocal("rc"). CommonLocal("ok").
+CommonLocal("tmp"). CommonLocal("len"). CommonLocal("buf"). CommonLocal("ptr").
+CommonLocal("result"). CommonLocal("status"). CommonLocal("count").
+CommonLocal("size"). CommonLocal("idx"). CommonLocal("val"). CommonLocal("fd").
 
 .decl GlobalVar(var: Sym)
+// Require 3+ distinct functions to reduce accidental name collisions
 GlobalVar(v) :-
     Def(f1, v, _, _),
     Def(f2, v, _, _),
-    f1 != f2,
+    Def(f3, v, _, _),
+    f1 != f2, f2 != f3, f1 != f3,
     !FormalParam(f1, v, _),
-    !FormalParam(f2, v, _).
+    !FormalParam(f2, v, _),
+    !FormalParam(f3, v, _),
+    !CommonLocal(v).
 
 GlobalVar(v) :-
     Use(f1, v, _, _),
     Use(f2, v, _, _),
-    f1 != f2,
+    Use(f3, v, _, _),
+    f1 != f2, f2 != f3, f1 != f3,
     !FormalParam(f1, v, _),
-    !FormalParam(f2, v, _).
+    !FormalParam(f2, v, _),
+    !FormalParam(f3, v, _),
+    !CommonLocal(v).
 
 // When any function taints a global variable, it becomes globally tainted.
 .decl TaintedGlobal(var: Sym, origin: Sym)

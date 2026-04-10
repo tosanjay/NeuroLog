@@ -1176,7 +1176,7 @@ def tool_search_cve(
     url = f"{base_url}?{urllib.parse.urlencode(params)}"
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "SourceCodeQL-Agent/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "NeuroLog-Agent/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
@@ -1405,7 +1405,7 @@ def tool_run_full_pipeline(
 # =============================================================================
 # Coordinator instruction (lightweight — routing + pipeline)
 # =============================================================================
-COORDINATOR_INSTRUCTION = """You are **SourceCodeQL**, a source code vulnerability analysis coordinator.
+COORDINATOR_INSTRUCTION = """You are **NeuroLog**, a source code vulnerability analysis coordinator.
 You help security researchers analyze C/C++ source code using Datalog-based formal reasoning.
 
 ## How to handle requests
@@ -1447,7 +1447,7 @@ Use individual tools directly:
 # =============================================================================
 # Sub-agent instructions
 # =============================================================================
-EXTRACTION_INSTRUCTION = """You are the **Extraction Agent** for SourceCodeQL.
+EXTRACTION_INSTRUCTION = """You are the **Extraction Agent** for NeuroLog.
 You extract Datalog facts from C/C++ source code using LLM-based analysis.
 
 Project context: {project_dir}
@@ -1468,7 +1468,7 @@ Slice targets: {slice_targets}
 - Transfer back to coordinator when done.
 """
 
-ANALYSIS_INSTRUCTION = """You are the **Analysis Agent** for SourceCodeQL.
+ANALYSIS_INSTRUCTION = """You are the **Analysis Agent** for NeuroLog.
 You run Souffle Datalog queries over extracted facts to find vulnerabilities.
 
 Extraction results: {extraction_summary}
@@ -1487,22 +1487,10 @@ Extraction results: {extraction_summary}
 - `taint.dl` — Intraprocedural taint
 - `patterns.dl` — Structural heuristics
 - `patterns_mem.dl` / `source_memsafety.dl` — Memory safety (UAF, double-free)
-- `source_type_safety.dl` — Type safety (integer overflow, truncation)
+- `source_type_safety.dl` — Type safety (integer overflow, truncation, counter-as-index, arith overflow)
 - `core.dl` — Basic def-use, reachability
 - `summary.dl` — Function summaries
 - `signatures.dl` — Library taint transfer models
-
-## Custom queries
-Compose with `tool_run_souffle(custom_rules=...)`:
-```
-.type Sym <: symbol
-.type Addr <: unsigned
-.decl Call(caller: Sym, callee: Sym, addr: Addr)
-.input Call
-.decl CallerOfFree(func: Sym)
-CallerOfFree(f) :- Call(f, "free", _).
-.output CallerOfFree
-```
 
 ## CRITICAL: Datalog-first reasoning discipline
 
@@ -1514,10 +1502,112 @@ CallerOfFree(f) :- Call(f, "free", _).
 4. **When in doubt, query.** A 3-line query returning empty beats a paragraph of reasoning.
 5. **Distinguish Datalog-derived vs. observations.** Label observations as unverified.
 
+## CRITICAL: Hypothesis-driven investigation
+
+**After the pipeline runs, your job is NOT done.** The pipeline finds ingredients. You must
+actively investigate whether those ingredients combine into real vulnerabilities by writing
+and running custom Datalog queries.
+
+### The investigation loop
+
+1. **Read pipeline output.** Look at TaintedSink, TypeSafetyFinding, CounterUsedAsIndex,
+   OverflowAtSink, etc. Group findings by function/variable.
+
+2. **Spot co-located findings.** When multiple findings share a function, variable, or struct
+   field, they may form a compound vulnerability. This is the signal to investigate.
+
+3. **Write a targeted query to test the hypothesis.** Use `tool_run_souffle(custom_rules=...)`
+   to compose a query that checks whether the ingredients actually connect.
+
+4. **Run, read results, refine.** If the query returns results, you've confirmed a chain.
+   If empty, write a different query or check your assumptions. Iterate.
+
+5. **Check for guards/sanitizers.** For every confirmed chain, write a negation query:
+   "is there a Guard between the source and the sink?" Empty result = unguarded = real bug.
+
+### Example investigations
+
+**Example 1: Unbounded counter → array OOB**
+Pipeline shows: UnboundedCounter(decode_frame, buf_index, 2448) and
+CounterUsedAsIndex(decode_frame, buf_index, 2448, 2718, "mem_write").
+Write a follow-up query to check if there's a guard on the path:
+```
+.type Sym <: symbol
+.type Addr <: number
+.type Ver <: number
+.decl Guard(func:Sym, addr:Addr, var:Sym, ver:Ver, op:Sym, bound:Sym, bound_type:Sym)
+.input Guard
+.decl DefReachesUse(func:Sym, var:Sym, def_line:Addr, use_line:Addr)
+.input DefReachesUse
+.decl GuardBetween(func:Sym, var:Sym, guard_addr:Addr, op:Sym, bound:Sym)
+GuardBetween(f, v, ga, op, b) :-
+    DefReachesUse(f, v, 2448, ga), Guard(f, ga, v, _, op, b, _),
+    DefReachesUse(f, v, ga, 2718).
+.output GuardBetween
+```
+
+**Example 2: Truncation + counter = sentinel collision**
+Pipeline shows: ImplicitTruncation(func, addr, counter, table_entry, 4, 2, ...) and
+UnboundedCounter(func, counter, incr_addr). Hypothesis: the counter wraps at 2^16 and
+collides with a memset sentinel. Write:
+```
+.type Sym <: symbol
+.type Addr <: number
+.type Ver <: number
+.decl UnboundedCounter(func:Sym, var:Sym, incr_addr:Addr)
+.input UnboundedCounter
+.decl ImplicitTruncation(func:Sym, addr:Addr, src:Sym, dst:Sym,
+    src_width:number, dst_width:number, src_type:Sym, dst_type:Sym)
+.input ImplicitTruncation
+.decl Call(caller:Sym, callee:Sym, addr:Addr)
+.input Call
+.decl TruncatedCounter(func:Sym, var:Sym, incr:Addr, trunc:Addr, width:number)
+TruncatedCounter(f, v, ia, ta, dw) :-
+    UnboundedCounter(f, v, ia),
+    ImplicitTruncation(f, ta, v, _, _, dw, _, _).
+.decl MemsetOnTarget(func:Sym, dst:Sym, call_addr:Addr)
+MemsetOnTarget(f, dst, ca) :-
+    ImplicitTruncation(f, _, _, dst, _, _, _, _),
+    Call(f, "memset", ca).
+.output TruncatedCounter
+.output MemsetOnTarget
+```
+
+**Example 3: Verifying a sink is truly unguarded**
+After finding TaintedSink(func, "memcpy", addr, 2, buf, "buffer_overflow", origin):
+```
+.type Sym <: symbol
+.type Addr <: number
+.type Ver <: number
+.decl Guard(func:Sym, addr:Addr, var:Sym, ver:Ver, op:Sym, bound:Sym, bound_type:Sym)
+.input Guard
+.decl AnyGuardOnVar(func:Sym, var:Sym, addr:Addr, op:Sym)
+AnyGuardOnVar(f, v, a, op) :- Guard(f, a, v, _, op, _, _).
+.output AnyGuardOnVar
+```
+If empty for the variable, it's truly unguarded.
+
+### Key principle
+
+The pipeline gives you 80% of the answer. The remaining 20% — confirming connections,
+checking guards, testing compound patterns — requires YOU to compose queries. This is the
+core value of the tool: LLM writes formal queries, Souffle proves or disproves them.
+Do not stop at reading pipeline output. Investigate.
+
+## Custom query template
+Always include type declarations when writing custom queries:
+```
+.type Sym <: symbol
+.type Addr <: number
+.type Ver <: number
+.type Idx <: number
+```
+Then declare inputs you need, write your rules, and add `.output` for results.
+
 Transfer back to coordinator when analysis is complete.
 """
 
-INTERPRETER_INSTRUCTION = """You are the **Interpreter Agent** for SourceCodeQL.
+INTERPRETER_INSTRUCTION = """You are the **Interpreter Agent** for NeuroLog.
 You read analysis results from disk, interpret findings, and generate reports.
 
 Analysis results: {analysis_summary}
@@ -1611,7 +1701,7 @@ are not present in the output CSVs or fact files.
   then your reasoning about how they combine.
 """
 
-CVE_INSTRUCTION = """You are the **CVE Agent** for SourceCodeQL.
+CVE_INSTRUCTION = """You are the **CVE Agent** for NeuroLog.
 You search the NIST NVD database to check if discovered vulnerabilities match known CVEs.
 
 Findings to cross-reference: {key_findings}
@@ -1768,7 +1858,7 @@ cve_agent = LlmAgent(
 # Build and register the root agent (coordinator)
 # =============================================================================
 root_agent = LlmAgent(
-    name="SourceCodeQL",
+    name="NeuroLog",
     model=create_model(),
     instruction=COORDINATOR_INSTRUCTION,
     before_model_callback=_trim_context,
