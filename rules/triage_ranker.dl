@@ -1,0 +1,226 @@
+// triage_ranker.dl — evidence-driven function ranker.
+//
+// Runs over mechanical (tree-sitter) facts BEFORE expensive LLM extraction.
+// Identifies functions with structural risk signals — patterns that
+// historically correlate with the bug classes the rule mesh hunts:
+// integer overflow into allocators, buffer overflow in loops, unguarded
+// pointer-arg dereferences, type-puning, tainted-source ingestion.
+//
+// Outputs:
+//   FuncRiskSignal(func, signal_kind, weight)  — atomic per-signal rows
+//   FuncRiskScore(func, total_score)           — aggregated per function
+//
+// Usage in the pipeline (Phase 2.5):
+//   1. mechanical extraction writes facts/*.facts for ALL functions (cheap)
+//   2. this rule runs (Souffle, sub-second on 30K facts)
+//   3. caller reads FuncRiskScore.csv, picks top-K, hands to LLM extractor
+//
+// Costs:
+//   - This file: 0 LLM cost. Pure Souffle.
+//   - Downstream: LLM extraction restricted to top-K → ~3x cheaper than
+//     extracting on the full call-graph slice.
+
+// ── Types ──────────────────────────────────────────────────────────
+.type Addr <: number
+.type Sym  <: symbol
+.type Ver  <: number
+.type Idx  <: number
+
+// ── Mechanical input relations (subset, just what we need) ─────────
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+
+.decl FormalParam(func: Sym, var: Sym, idx: Idx)
+.input FormalParam
+
+.decl CFGEdge(func: Sym, from_addr: Addr, to_addr: Addr)
+.input CFGEdge
+
+.decl MemRead(func: Sym, addr: Addr, base: Sym, offset: Sym, size: Sym)
+.input MemRead
+
+.decl MemWrite(func: Sym, addr: Addr, target: Sym, mem_in: Ver, mem_out: Ver)
+.input MemWrite
+
+.decl ArithOp(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+              op: Sym, src: Sym, src_ver: Ver, operand: Sym)
+.input ArithOp
+
+.decl Cast(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+           src: Sym, src_ver: Ver, kind: Sym, src_width: number,
+           dst_width: number, src_type: Sym, dst_type: Sym)
+.input Cast
+
+.decl Guard(func: Sym, addr: Addr, var: Sym, ver: Ver,
+            op: Sym, bound: Sym, bound_type: Sym)
+.input Guard
+
+// ── Inline DangerousSink / TaintSource catalogs ────────────────────
+// Kept inline so the ranker is standalone — runs even before the main
+// pipeline writes DangerousSink.facts. Mirror the source_interproc.dl
+// list with arg indices.
+
+.decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
+DangerousSink("memcpy",  0, "buffer_overflow").
+DangerousSink("memcpy",  2, "buffer_overflow").
+DangerousSink("memmove", 0, "buffer_overflow").
+DangerousSink("memmove", 2, "buffer_overflow").
+DangerousSink("memset",  0, "buffer_overflow").
+DangerousSink("memset",  2, "buffer_overflow").
+DangerousSink("strcpy",  1, "buffer_overflow").
+DangerousSink("strncpy", 2, "buffer_overflow").
+DangerousSink("strcat",  1, "buffer_overflow").
+DangerousSink("strncat", 1, "buffer_overflow").
+DangerousSink("read",    1, "buffer_overflow").
+DangerousSink("recv",    1, "buffer_overflow").
+DangerousSink("recvfrom",1, "buffer_overflow").
+DangerousSink("fread",   0, "buffer_overflow").
+DangerousSink("fgets",   0, "buffer_overflow").
+DangerousSink("gets",    0, "buffer_overflow").
+DangerousSink("sprintf", 1, "format_string").
+DangerousSink("snprintf",2, "format_string").
+DangerousSink("printf",  0, "format_string").
+DangerousSink("fprintf", 1, "format_string").
+DangerousSink("malloc",  0, "alloc_size").
+DangerousSink("calloc",  0, "alloc_size").
+DangerousSink("calloc",  1, "alloc_size").
+DangerousSink("realloc", 1, "alloc_size").
+DangerousSink("free",    0, "free_arg").
+
+.decl TaintSourceFunc(name: Sym)
+TaintSourceFunc("read"). TaintSourceFunc("recv"). TaintSourceFunc("recvfrom").
+TaintSourceFunc("fread"). TaintSourceFunc("fgets"). TaintSourceFunc("fgetc").
+TaintSourceFunc("gets"). TaintSourceFunc("getenv"). TaintSourceFunc("scanf").
+TaintSourceFunc("fscanf"). TaintSourceFunc("getline").
+// Codec/parser-specific external-input wrappers (libwebp, ffmpeg, libxml2)
+TaintSourceFunc("VP8LReadBits"). TaintSourceFunc("VP8GetValue").
+TaintSourceFunc("ReadChunkSize"). TaintSourceFunc("avio_read").
+TaintSourceFunc("xmlBufContent").
+
+// ── Function universe (any function with any extracted fact) ───────
+.decl Function(f: Sym)
+Function(f) :- Def(f, _, _, _).
+Function(f) :- Use(f, _, _, _).
+Function(f) :- Call(f, _, _).
+Function(f) :- FormalParam(f, _, _).
+
+// ── Loop body detection (CFG back-edge approximation) ──────────────
+// A back-edge is a CFGEdge to an earlier line. Treat any addr in the
+// range [to_addr, from_addr] as "in a loop body" — a coarse but cheap
+// approximation that works because tree-sitter emits CFGEdges in source
+// order and loops branch backward to the header line.
+.decl InLoopBody(func: Sym, addr: Addr)
+InLoopBody(f, a) :-
+    CFGEdge(f, from_addr, to_addr),
+    to_addr < from_addr,
+    a >= to_addr,
+    a <= from_addr,
+    (Def(f, _, _, a) ; Use(f, _, _, a) ; MemWrite(f, a, _, _, _) ;
+     MemRead(f, a, _, _, _) ; Call(f, _, a)).
+
+// ════════════════════════════════════════════════════════════════════
+// SIGNAL RULES — each fires when a function has a structural pattern
+// that correlates with one of the bug classes the mesh hunts.
+// ════════════════════════════════════════════════════════════════════
+
+// Signal 1: ArithOp result flowing to a sink's size/dest arg.
+// Catches: integer-overflow-into-allocator (the dominant codec bug shape).
+.decl Signal_ArithToSink(func: Sym)
+Signal_ArithToSink(f) :-
+    ArithOp(f, _, dst, _, _, _, _, _),
+    Call(f, callee, ca),
+    ActualArg(ca, idx, _, dst, _),
+    DangerousSink(callee, idx, _).
+
+// Signal 2: MemWrite inside a loop body.
+// Catches: classic buffer-overflow-in-loop patterns where the iteration
+// variable controls a buffer index that the rule mesh can't yet see is
+// unbounded.
+.decl Signal_MemWriteInLoop(func: Sym)
+Signal_MemWriteInLoop(f) :-
+    MemWrite(f, a, _, _, _),
+    InLoopBody(f, a).
+
+// Signal 3: MemRead on a formal-param pointer with no in-function Guard
+// on that param. Catches: unchecked caller-provided-buffer dereferences.
+.decl Signal_UnguardedParamPtrRead(func: Sym)
+Signal_UnguardedParamPtrRead(f) :-
+    FormalParam(f, p, _),
+    MemRead(f, _, p, _, _),
+    !Guard(f, _, p, _, _, _, _).
+
+// Signal 4: Cast at a sink's arg site. Catches: narrowing casts going
+// into memcpy/malloc/etc. — the integer-truncation-at-size pattern.
+.decl Signal_CastAtSinkArg(func: Sym)
+Signal_CastAtSinkArg(f) :-
+    Cast(f, a, dst, _, _, _, _, _, _, _, _),
+    Call(f, callee, a),
+    ActualArg(a, idx, _, dst, _),
+    DangerousSink(callee, idx, _).
+
+// Signal 5: Function calls a known taint source. Catches: entry-point
+// functions where external data enters the program — often the start
+// of any interesting taint chain.
+.decl Signal_TaintSourceCall(func: Sym)
+Signal_TaintSourceCall(f) :-
+    Call(f, callee, _),
+    TaintSourceFunc(callee).
+
+// Signal 6: Heavy MemWrite (≥ 5 writes). Catches: parsers and copiers
+// where buffer manipulation is the function's main job.
+.decl MemWriteCount(func: Sym, n: number)
+MemWriteCount(f, n) :-
+    Function(f),
+    n = count : { MemWrite(f, _, _, _, _) },
+    n > 0.
+
+.decl Signal_HeavyMemWrite(func: Sym)
+Signal_HeavyMemWrite(f) :- MemWriteCount(f, n), n >= 5.
+
+// Signal 7: Allocator-call return without a NULL guard.
+// Catches: unchecked-malloc dereference (the classic NULL-deref pattern).
+.decl Signal_UncheckedAlloc(func: Sym)
+Signal_UncheckedAlloc(f) :-
+    Call(f, callee, ca),
+    (callee = "malloc" ; callee = "calloc" ; callee = "realloc"),
+    Def(f, dst, _, ca),
+    !Guard(f, _, dst, _, _, _, _).
+
+// Signal 8: Function calls free/realloc/dealloc — life-cycle risk.
+.decl Signal_LifecycleSink(func: Sym)
+Signal_LifecycleSink(f) :-
+    Call(f, callee, _),
+    (callee = "free" ; callee = "realloc" ;
+     contains("free", callee) ; contains("dealloc", callee)).
+
+// ════════════════════════════════════════════════════════════════════
+// Aggregate into FuncRiskSignal (atomic) + FuncRiskScore (total)
+// ════════════════════════════════════════════════════════════════════
+
+.decl FuncRiskSignal(func: Sym, signal: Sym, weight: number)
+
+FuncRiskSignal(f, "arith_to_sink",         5) :- Signal_ArithToSink(f).
+FuncRiskSignal(f, "memwrite_in_loop",      4) :- Signal_MemWriteInLoop(f).
+FuncRiskSignal(f, "unguarded_param_ptr",   3) :- Signal_UnguardedParamPtrRead(f).
+FuncRiskSignal(f, "cast_at_sink",          4) :- Signal_CastAtSinkArg(f).
+FuncRiskSignal(f, "taint_source",          3) :- Signal_TaintSourceCall(f).
+FuncRiskSignal(f, "heavy_memwrite",        2) :- Signal_HeavyMemWrite(f).
+FuncRiskSignal(f, "unchecked_alloc",       3) :- Signal_UncheckedAlloc(f).
+FuncRiskSignal(f, "lifecycle_sink",        2) :- Signal_LifecycleSink(f).
+
+.decl FuncRiskScore(func: Sym, score: number)
+FuncRiskScore(f, s) :-
+    FuncRiskSignal(f, _, _),
+    s = sum w : { FuncRiskSignal(f, _, w) }.
+
+.output FuncRiskSignal
+.output FuncRiskScore
