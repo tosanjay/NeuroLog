@@ -1396,6 +1396,70 @@ def tool_set_entry_taint(
 
 
 # =============================================================================
+# Tool: Triage augment (LITE-LLM adaptive re-ranking)
+# =============================================================================
+def tool_triage_augment(top_k: int = 30) -> dict:
+    """Run the LITE-LLM triage augmentor on the current baseline ranking.
+
+    Prerequisite: mechanical extraction has been run (facts/*.facts on
+    disk) AND tool_triage_rank's baseline is computable.
+
+    Pipeline:
+      1. Compute baseline FuncRiskScore via _run_triage_ranker().
+      2. Enumerate ALL functions in the project (for LLM context).
+      3. One Lite-tier LLM call (V4-Flash equivalent) proposes
+         {func, delta, reason} adjustments per name/signal heuristics.
+      4. Apply bounded adjustments (±2 to ±5, ≤ 20 total) and return
+         the adjusted top-K ranking + the applied adjustments.
+
+    Args:
+        top_k: number of top-scoring functions to return in the result.
+
+    Returns:
+        {
+          "baseline_top": [...],     # top-K before augmentation
+          "adjustments":  [...],     # applied {func, delta, reason}
+          "ranked":       [...],     # top-K after augmentation
+          "total_scored": N,
+        }
+    """
+    scores = _run_triage_ranker(FACTS_DIR)
+    if not scores:
+        return {"error": "no scores produced (mechanical facts missing?)"}
+    # Build the all-funcs list from current Def.facts.
+    def_facts = FACTS_DIR / "Def.facts"
+    if not def_facts.is_file():
+        return {"error": f"Def.facts not found at {def_facts}"}
+    all_funcs = sorted({line.split("\t", 1)[0]
+                        for line in def_facts.read_text().splitlines()
+                        if line.strip()})
+    # Try to infer project name from a sibling project_config.json or
+    # FACTS_DIR's parent directory name.
+    project_basename = FACTS_DIR.parent.name or "project"
+    cfg = FACTS_DIR.parent / "project_config.json"
+    if cfg.is_file():
+        try:
+            project_basename = json.loads(cfg.read_text()).get(
+                "project_name", project_basename)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    augment_mod = _import("triage_augment")
+    adjusted, applied = augment_mod.augment_ranking(
+        scores, all_funcs, project_basename)
+    baseline_top = sorted(scores.items(),
+                           key=lambda kv: -kv[1])[:top_k]
+    ranked = sorted(adjusted.items(), key=lambda kv: -kv[1])[:top_k]
+    return {
+        "project": project_basename,
+        "total_scored": len(scores),
+        "baseline_top": [{"func": f, "score": s} for f, s in baseline_top],
+        "adjustments": applied,
+        "ranked": [{"func": f, "score": s} for f, s in ranked],
+    }
+
+
+# =============================================================================
 # Tool: Triage rank (evidence-driven function ranking)
 # =============================================================================
 def tool_triage_rank(top_k: int = 30) -> dict:
@@ -1793,6 +1857,37 @@ def tool_run_full_pipeline(
                         print(f"  [pipeline] Phase 2.5b: Running triage_ranker.dl")
                         try:
                             scores = _run_triage_ranker(FACTS_DIR)
+                            # Phase 2.5b': optional LITE-LLM augmentor that
+                            # re-weights the deterministic baseline using
+                            # codebase-name-based heuristics. Off unless
+                            # TRIAGE_AUGMENT=1 — adds one Lite-tier LLM
+                            # call (~$0.01-0.05) per pipeline run.
+                            if (scores and
+                                os.getenv("TRIAGE_AUGMENT", "").lower()
+                                in ("1", "true", "yes")):
+                                print("  [pipeline] Phase 2.5b': "
+                                      "LITE-LLM triage augmentation...")
+                                try:
+                                    augment_mod = _import("triage_augment")
+                                    def_facts = FACTS_DIR / "Def.facts"
+                                    all_funcs = sorted({
+                                        ln.split("\t", 1)[0]
+                                        for ln in def_facts.read_text().splitlines()
+                                        if ln.strip()
+                                    }) if def_facts.is_file() else list(scores)
+                                    proj_name = FACTS_DIR.parent.name
+                                    scores, applied = augment_mod.augment_ranking(
+                                        scores, all_funcs, proj_name)
+                                    if applied:
+                                        print(f"  [pipeline]   applied "
+                                              f"{len(applied)} adjustments; "
+                                              f"e.g. {applied[:3]}")
+                                    summary["phases"]["triage_augment"] = {
+                                        "adjustments": len(applied),
+                                        "sample": applied[:5],
+                                    }
+                                except Exception as e:
+                                    errors.append(f"triage-augment: {e}")
                             ranked = sorted(scores.items(),
                                             key=lambda kv: -kv[1])
                             slice_set = set(targets)
@@ -2781,6 +2876,7 @@ root_agent = LlmAgent(
         FunctionTool(tool_scan_project),
         FunctionTool(tool_build_slice),
         FunctionTool(tool_triage_rank),
+        FunctionTool(tool_triage_augment),
         FunctionTool(tool_clean_workspace),
         FunctionTool(tool_read_source),
         FunctionTool(tool_list_datalog_files),
