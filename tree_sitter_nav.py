@@ -9,6 +9,7 @@ No compilation required. Uses tree-sitter for:
 - Function source extraction
 """
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -62,14 +63,58 @@ def _parse_file(parser: Parser, file_path: str) -> "tree_sitter.Tree":
     return parser.parse(source), source
 
 
+# Subdirectory patterns commonly outside the attack surface for
+# library-style targets. Heuristically excluded so the slice + ranker
+# don't burn LLM budget on encoder-side image readers, tooling
+# fixtures, fuzzer harnesses themselves, etc. Override via the
+# NEUROLOG_INCLUDE_EXAMPLES=1 env var if the test/example directory IS
+# the actual analysis target.
+_NOISE_DIR_PATTERNS = (
+    "/examples/",
+    "/example/",
+    "/tests/",
+    "/test/",
+    "/imageio/",   # libwebp encoder-side image readers (ReadPNM/PNG/JPEG)
+    "/fuzz/",
+    "/fuzzers/",
+    "/benchmarks/",
+    "/benchmark/",
+    "/tools/",
+    "/utils_app/",
+    "/extras/",
+    "/build/",
+    "/build_asan/",
+    "/build_fuzz/",
+    "/cmake/",
+)
+
+
+def _path_is_noise(file_path: str) -> bool:
+    if os.environ.get("NEUROLOG_INCLUDE_EXAMPLES", "").lower() in ("1", "true"):
+        return False
+    p = "/" + file_path.replace("\\", "/").lstrip("/")
+    return any(pat in p for pat in _NOISE_DIR_PATTERNS)
+
+
 def enumerate_functions(project_dir: str, extensions: tuple = (".c", ".h")) -> list[FuncInfo]:
-    """Walk project directory, return all C function definitions."""
+    """Walk project directory, return all C function definitions.
+
+    Files under common attack-surface-irrelevant subdirectories
+    (examples/, tests/, imageio/, fuzz/, tools/, etc.) are skipped by
+    default to keep the slice focused on library code that an external
+    harness can actually reach. Set NEUROLOG_INCLUDE_EXAMPLES=1 to
+    disable the filter (e.g. when the analysis target IS a tool/example).
+    """
     parser = _create_parser()
     functions = []
     project = Path(project_dir)
+    skipped_files = 0
 
     for ext in extensions:
         for fpath in project.rglob(f"*{ext}"):
+            if _path_is_noise(str(fpath)):
+                skipped_files += 1
+                continue
             try:
                 tree, source = _parse_file(parser, str(fpath))
             except Exception as e:
@@ -80,7 +125,10 @@ def enumerate_functions(project_dir: str, extensions: tuple = (".c", ".h")) -> l
                 info = _extract_func_info(node, source, str(fpath))
                 if info:
                     functions.append(info)
-
+    if skipped_files:
+        print(f"  [scan] skipped {skipped_files} file(s) under "
+              f"examples/tests/imageio/etc. — set "
+              f"NEUROLOG_INCLUDE_EXAMPLES=1 to include them")
     return functions
 
 
