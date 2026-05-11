@@ -174,6 +174,49 @@ def _extraction_cache_valid(project_dir: str, functions: list[str]) -> tuple[boo
     return True, f"cache valid (extracted {ts}, {len(cached_funcs)} functions, {len(fact_files)} fact files)"
 
 
+def _run_triage_ranker(facts_dir: Path) -> dict[str, int]:
+    """Run rules/triage_ranker.dl against an existing mechanical fact base
+    and return a `function_name → risk_score` dict.
+
+    Used by tool_run_full_pipeline (legacy mode) to evidence-rank the LLM
+    extraction target set before paying for deep semantic extraction.
+    Souffle is invoked as a subprocess against a temp output directory;
+    output dir is cleaned up unconditionally.
+    """
+    import tempfile
+    rules_dir = Path(__file__).resolve().parent / "rules"
+    ranker_dl = rules_dir / "triage_ranker.dl"
+    if not ranker_dl.is_file():
+        print(f"  [triage] ranker rule file not found: {ranker_dl}")
+        return {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_out = Path(tmp)
+        try:
+            r = subprocess.run(
+                ["souffle", "-F", str(facts_dir),
+                 "-D", str(tmp_out), str(ranker_dl)],
+                capture_output=True, timeout=120, check=False)
+            if r.returncode != 0:
+                err = r.stderr.decode("latin1", "replace")[-1000:]
+                print(f"  [triage] souffle failed (rc={r.returncode}): {err}")
+                return {}
+        except subprocess.TimeoutExpired:
+            print("  [triage] souffle timed out after 120s")
+            return {}
+        score_csv = tmp_out / "FuncRiskScore.csv"
+        if not score_csv.is_file():
+            return {}
+        scores: dict[str, int] = {}
+        for line in score_csv.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2:
+                try:
+                    scores[parts[0]] = int(parts[1])
+                except ValueError:
+                    continue
+        return scores
+
+
 # =============================================================================
 # Tool: Clean workspace
 # =============================================================================
@@ -1353,6 +1396,46 @@ def tool_set_entry_taint(
 
 
 # =============================================================================
+# Tool: Triage rank (evidence-driven function ranking)
+# =============================================================================
+def tool_triage_rank(top_k: int = 30) -> dict:
+    """Rank functions by structural risk signals from mechanical facts.
+
+    Prerequisite: mechanical extraction must have run at least once (so
+    facts/*.facts exists). Then this tool runs rules/triage_ranker.dl
+    (sub-second Souffle pass) and returns the top-K highest-scoring
+    functions with per-signal breakdowns.
+
+    Signals:
+      - arith_to_sink:      ArithOp result flows to a sink's size/dest arg (weight 5)
+      - cast_at_sink:       Cast at a sink call's arg site (weight 4)
+      - memwrite_in_loop:   MemWrite inside a loop body (weight 4)
+      - taint_source:       function calls a known taint source (weight 3)
+      - unguarded_param_ptr:MemRead on a formal-param pointer w/ no guard (weight 3)
+      - unchecked_alloc:    malloc/calloc/realloc result used without NULL guard (3)
+      - heavy_memwrite:     ≥ 5 MemWrites in the function (weight 2)
+      - lifecycle_sink:     calls free/realloc/dealloc-like (weight 2)
+
+    Args:
+        top_k: number of top-scoring functions to return (default 30).
+
+    Returns:
+        {"total_scored": N, "top_k": K, "ranked": [(func, score), ...]}
+    """
+    scores = _run_triage_ranker(FACTS_DIR)
+    if not scores:
+        return {"error": "no scores produced (mechanical facts missing or "
+                          "ranker failed)",
+                "facts_dir": str(FACTS_DIR)}
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    return {
+        "total_scored": len(scores),
+        "top_k": top_k,
+        "ranked": [{"func": f, "score": s} for f, s in ranked[:top_k]],
+    }
+
+
+# =============================================================================
 # Tool: Validate LLM extraction accuracy
 # =============================================================================
 def tool_validate_extraction(
@@ -1685,6 +1768,59 @@ def tool_run_full_pipeline(
             extraction_mode = os.getenv("EXTRACTION_MODE", "mechanical").lower()
             try:
                 if extraction_mode == "legacy":
+                    # Evidence-driven triage:
+                    # 1. mechanical bootstrap on the call-graph slice (cheap,
+                    #    no smell pass) — produces facts/*.facts the ranker can
+                    #    read.
+                    # 2. run rules/triage_ranker.dl to score each function by
+                    #    structural risk signals (ArithOp→sink, MemWrite in
+                    #    loop, unguarded ptr arg deref, taint source, etc.).
+                    # 3. final target list = top-K by score ∪ the original
+                    #    slice intersected with scored set. Falls back to the
+                    #    raw slice if ranker produces nothing (skip if user
+                    #    explicitly opts out via TRIAGE_TOP_K=0).
+                    triage_top_k = int(os.getenv("TRIAGE_TOP_K", "100"))
+                    if triage_top_k > 0:
+                        print(f"  [pipeline] Phase 2.5a: Mechanical bootstrap "
+                              f"for triage ranker ({len(targets)} functions)")
+                        try:
+                            tool_extract_mechanical_with_smell(
+                                project_dir, function_names=targets,
+                                extensions=extensions, skip_smell=True,
+                                fallback_on_low_confidence=False)
+                        except Exception as e:
+                            errors.append(f"triage-bootstrap: {e}")
+                        print(f"  [pipeline] Phase 2.5b: Running triage_ranker.dl")
+                        try:
+                            scores = _run_triage_ranker(FACTS_DIR)
+                            ranked = sorted(scores.items(),
+                                            key=lambda kv: -kv[1])
+                            slice_set = set(targets)
+                            # Take top-K from the ranker; cap at len(scores).
+                            top_funcs = [name for name, _ in ranked[:triage_top_k]]
+                            # Union with original slice (preserve unscored
+                            # functions that are still in the call-graph
+                            # slice but cap total at 2*top_k for sanity).
+                            unscored_slice = [t for t in targets
+                                              if t not in scores]
+                            final_targets = (top_funcs +
+                                             unscored_slice[:triage_top_k])
+                            if final_targets:
+                                old_n = len(targets)
+                                targets = final_targets
+                                top3 = ranked[:3]
+                                print(f"  [pipeline] Phase 2.5c: triage "
+                                      f"reduced slice {old_n} → "
+                                      f"{len(targets)}; top-3: {top3}")
+                                summary["phases"]["triage"] = {
+                                    "scored": len(scores),
+                                    "top_k": triage_top_k,
+                                    "final_targets": len(targets),
+                                    "top_3": [{"func": n, "score": s}
+                                              for n, s in top3],
+                                }
+                        except Exception as e:
+                            errors.append(f"triage-ranker: {e}")
                     extract_result = tool_extract_slice(
                         project_dir, function_names=targets, extensions=extensions)
                 else:
@@ -2644,6 +2780,7 @@ root_agent = LlmAgent(
         FunctionTool(tool_run_full_pipeline),
         FunctionTool(tool_scan_project),
         FunctionTool(tool_build_slice),
+        FunctionTool(tool_triage_rank),
         FunctionTool(tool_clean_workspace),
         FunctionTool(tool_read_source),
         FunctionTool(tool_list_datalog_files),
