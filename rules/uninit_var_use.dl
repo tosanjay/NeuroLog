@@ -1,0 +1,79 @@
+// Uninitialized-memory-use rules — variables read before any assignment.
+//
+// Source-side advantage: declared variables vs formal parameters are
+// syntactically distinct in source code; binaries can't tell them apart
+// without expensive frame-pointer recovery + SSA reconstruction.
+//
+// Strict case (this pass): variable used and never assigned anywhere
+// in the function. Catches the obvious `int x; use(x);` pattern.
+// Partial-init case (variable defined on some paths, used on a path
+// that bypasses those defs) needs control-flow dominance reasoning;
+// left as a follow-up Pass 8.5 once BlockReach / Dominates joins are
+// stable on this corpus.
+//
+// Project Zero-class bugs in this family: kernel uninit-stack-leak
+// (CVE-2018-17977 et al.), parser uninit-field-deref (CVE-2020-15366
+// in libxslt), and "use of struct after `goto` over its initializer".
+
+.type Sym  <: symbol
+.type Addr <: number
+.type Ver  <: number
+.type Idx  <: number
+
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+.decl FormalParam(func: Sym, var: Sym, idx: Idx)
+.input FormalParam
+.decl AddressOf(func: Sym, var: Sym, ver: Ver, target: Sym)
+.input AddressOf
+
+// Helper: any def of the variable anywhere in the function.
+.decl HasAnyDef(func: Sym, var: Sym)
+HasAnyDef(f, v) :- Def(f, v, _, _).
+
+// Helper: variable was passed to a function via &v (so the callee may
+// have initialized it — we conservatively treat this as "may be init").
+.decl AddressTaken(func: Sym, var: Sym)
+AddressTaken(f, v) :- AddressOf(f, _, _, v).
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 1: Strict uninit-use
+// ════════════════════════════════════════════════════════════════════
+// Variable is used in the function but never defined and not a formal
+// parameter. Address-taken variables are excluded because callees may
+// init them via outparam.
+
+.decl UninitVarUse(func: Sym, var: Sym, addr: Addr)
+UninitVarUse(f, v, a) :-
+    Use(f, v, _, a),
+    !FormalParam(f, v, _),
+    !HasAnyDef(f, v),
+    !AddressTaken(f, v),
+    v != "mem".
+.output UninitVarUse
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 2: Tainted uninit-use
+// ════════════════════════════════════════════════════════════════════
+// Higher-signal subset: the uninit variable is used as an argument
+// to a function call, and that call site's data flows from a tainted
+// source elsewhere — i.e., a partially-initialized struct passed to
+// a sink. (Optional input — degrades gracefully when TaintedVar is
+// empty.)
+
+.decl TaintedVar(func: Sym, var: Sym, ver: Ver, origin: Sym, ctx: Addr)
+.input TaintedVar
+.decl ActualArg(call_addr: Addr, arg_idx: Idx, param: Sym, var: Sym, ver: Ver)
+.input ActualArg
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+.decl TaintedUninitArg(caller: Sym, callee: Sym, addr: Addr,
+                        arg_idx: Idx, var: Sym)
+TaintedUninitArg(f, callee, ca, idx, v) :-
+    UninitVarUse(f, v, ca),
+    Call(f, callee, ca),
+    ActualArg(ca, idx, _, v, _).
+.output TaintedUninitArg

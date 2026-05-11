@@ -48,6 +48,10 @@
 .decl MemRead(func: Sym, addr: Addr, base: Sym, offset: Sym, size: Sym)
 .input MemRead
 
+.decl FieldWrite(func: Sym, addr: Addr, base: Sym, field: Sym,
+                 mem_in: Ver, mem_out: Ver)
+.input FieldWrite
+
 .decl StackVar(func: Sym, var: Sym, offset: Sym, size: number)
 .input StackVar
 
@@ -78,12 +82,52 @@
 CFGReach(f, a, b) :- CFGEdge(f, a, b).
 CFGReach(f, a, c) :- CFGReach(f, a, b), CFGEdge(f, b, c).
 
-// ── Helper: Reachability-aware guard check ────────────────────────
-// A guard is "effective" for a use site only if the guard precedes
-// the use site on some CFG path (not just anywhere in the function).
+// ── Inputs from source_dominance.dl (block-level dominance) ───────
+// Recycled to facts/ before this rule runs. EffectiveGuardDom is the
+// path-sensitive replacement for the old reach-only EffectiveGuard:
+// a guard at `ga` is dominance-effective for use at `ua` iff every
+// CFG path from function entry to `ua` passes through `ga`'s block
+// (or they share a block and `ga` precedes `ua`).
+.decl EffectiveGuardDom(func: Sym, guard_addr: Addr, use_addr: Addr, var: Sym)
+.input EffectiveGuardDom
+
+.decl FuncDominanceTractable(func: Sym)
+.input FuncDominanceTractable
+
+// ── Helper: Effective guard ────────────────────────────────────────
+// Path-sensitive when dominance has been computed for the function;
+// falls back to plain reachability for functions past the size gate
+// (or for sessions where source_dominance.dl has not been run yet,
+// in which case EffectiveGuardDom and FuncDominanceTractable are
+// empty and only the fallback rule fires).
 .decl EffectiveGuard(func: Sym, guard_addr: Addr, use_addr: Addr, var: Sym)
+
+// Path-sensitive: guard dominates the use.
+EffectiveGuard(f, ga, ua, v) :-
+    EffectiveGuardDom(f, ga, ua, v).
+// Fallback: reach-only when dominance isn't available for this function.
 EffectiveGuard(f, ga, ua, v) :-
     Guard(f, ga, v, _, _, _, _),
+    CFGReach(f, ga, ua),
+    !FuncDominanceTractable(f).
+
+// ── Validator-as-guard (LLM smell-pass) ─────────────────────────────
+// Project-specific wrappers like stbi__mad3sizes_valid(a,b,c,add) are
+// real bounds checks but neither the AST nor the standard Guard rule
+// recognise them. The smell pass classifies these via IsValidator.facts
+// (and optionally IsValidatorArg.facts naming the checked arg indices).
+// A call to such a validator that reaches a downstream use is treated
+// as an effective guard for any argument variable it passes.
+.decl IsValidator(name: Sym)
+.input IsValidator
+
+.decl IsValidatorArg(name: Sym, arg_idx: Sym)
+.input IsValidatorArg
+
+EffectiveGuard(f, ga, ua, v) :-
+    Call(f, callee, ga),
+    IsValidator(callee),
+    ActualArg(ga, _, _, v, _),
     CFGReach(f, ga, ua).
 
 // ── Helper: size-sensitive sinks ───────────────────────────────────
@@ -349,13 +393,23 @@ AllocThenUnboundedCopy(f, aa, ca, buf, asz, af, callee, origin) :-
 .decl UncheckedAlloc(func: Sym, alloc_addr: Addr, buf_var: Sym,
                      use_addr: Addr, alloc_func: Sym)
 
-// Helper: NULL-check guard that precedes a use site on the CFG
+// Helper: NULL-check guard that effectively precedes a use site.
+// Path-sensitive when dominance is available; reach-fallback otherwise.
 .decl EffectiveNullGuard(func: Sym, guard_addr: Addr, use_addr: Addr, var: Sym)
+
+// Path-sensitive: NULL-check guard dominates the use.
+EffectiveNullGuard(f, ga, ua, v) :-
+    EffectiveGuardDom(f, ga, ua, v),
+    Guard(f, ga, v, _, op, bound, _),
+    (op = "ne" ; op = "eq"),
+    (bound = "NULL" ; bound = "0").
+// Fallback: reach-only when dominance isn't available.
 EffectiveNullGuard(f, ga, ua, v) :-
     Guard(f, ga, v, _, op, bound, _),
     (op = "ne" ; op = "eq"),
     (bound = "NULL" ; bound = "0"),
-    CFGReach(f, ga, ua).
+    CFGReach(f, ga, ua),
+    !FuncDominanceTractable(f).
 
 UncheckedAlloc(f, aa, buf, use_a, af) :-
     AllocSite(f, aa, buf, _, af),
@@ -417,15 +471,76 @@ UnguardedTaintedSize(f, ca, callee, sv, idx, origin) :-
 // and C++ delete-like patterns.
 .decl FreedVar(func: Sym, var: Sym, free_line: Addr)
 
+// G6: free-struct-member vs free-struct distinction.
+// Calls into wrappers that ONLY free the struct's inner fields (and not
+// the struct's own memory slot) are not "freeing the variable" for
+// double-free / use-after-free purposes. The smell pass classifies these
+// wrappers via IsFreeMembers; the Datalog FreedVar rule excludes them.
+.decl IsFreeMembers(name: Sym)
+.input IsFreeMembers
+
 FreedVar(f, ptr, fa) :-
     Call(f, callee, fa),
     (callee = "free" ; contains("free", callee) ; contains("deallocate", callee)),
+    !IsFreeMembers(callee),
     ActualArg(fa, 0, _, ptr, _).
+
+// ── Free-and-NULL wrappers ──────────────────────────────────────────
+// Functions that do `free(*p); *p = NULL;` — the caller's pointer
+// *slot* is cleared, so subsequent WRITES to that slot are safe (they
+// re-populate the slot, not the freed memory). Only READS of *p after
+// such a call are unsafe (NPD on NULL, and conceptually still UAF if
+// the slot were re-aliased). We exempt MemWrite uses below.
+.decl FreeAndNullFunc(name: Sym)
+FreeAndNullFunc("av_freep").
+FreeAndNullFunc("av_buffer_unref").
+FreeAndNullFunc("av_packet_unref").
+FreeAndNullFunc("av_packet_free").
+FreeAndNullFunc("av_frame_unref").
+FreeAndNullFunc("av_frame_free").
+FreeAndNullFunc("av_dict_free").
+FreeAndNullFunc("av_freep_safe").
+
+.decl FreedViaFreeAndNull(func: Sym, var: Sym, free_line: Addr)
+FreedViaFreeAndNull(f, ptr, fa) :-
+    FreedVar(f, ptr, fa),
+    Call(f, callee, fa),
+    FreeAndNullFunc(callee).
+
+// Materialise "this var was freed via free-and-null AND the use is a
+// MemWrite into the cleared slot" so we can negate it cleanly.
+.decl SafeWriteAfterFreeAndNull(func: Sym, var: Sym, write_addr: Addr)
+SafeWriteAfterFreeAndNull(f, ptr, ua) :-
+    FreedViaFreeAndNull(f, ptr, _),
+    MemWrite(f, ua, ptr, _, _).
+SafeWriteAfterFreeAndNull(f, ptr, ua) :-
+    FreedViaFreeAndNull(f, ptr, _),
+    FieldWrite(f, ua, ptr, _, _, _).
 
 // Step 2: Use-after-free — ptr is used after being freed, and the same
 // definition that reached the free also reaches the post-free use
 // (meaning ptr was NOT reassigned between free and use).
 .decl UseAfterFree(func: Sym, var: Sym, free_line: Addr, use_line: Addr)
+
+// G5: loop-iteration awareness — if there's a Def of `ptr` somewhere
+// between the free and the use on the CFG, then the value reaching the
+// use is NOT the freed value. This covers two patterns:
+//   (a) loop body: `for { ptr = src; ... ; use(ptr); ... ; free(ptr); }`
+//       The use in iteration N+1 reads the new Def at loop top, not the
+//       iteration-N freed pointer. Back-edge: free → loop-header → Def → use.
+//   (b) intra-block reinit: `free(ptr); ptr = malloc(...); use(ptr);`
+//       The Def between free and use clearly replaces the reference.
+.decl ReinitBetweenFreeAndUse(func: Sym, var: Sym, free_addr: Addr,
+                              use_addr: Addr)
+.output ReinitBetweenFreeAndUse
+ReinitBetweenFreeAndUse(f, ptr, fa, ua) :-
+    FreedVar(f, ptr, fa),
+    Use(f, ptr, _, ua),
+    Def(f, ptr, _, da),
+    da != fa,
+    da != ua,
+    CFGReach(f, fa, da),
+    CFGReach(f, da, ua).
 
 UseAfterFree(f, ptr, fa, ua) :-
     FreedVar(f, ptr, fa),
@@ -434,7 +549,13 @@ UseAfterFree(f, ptr, fa, ua) :-
     ua != fa,                        // not the free call itself
     // Same def reaches both free and use → no reassignment between them
     DefReachesUse(f, ptr, d, fa),
-    DefReachesUse(f, ptr, d, ua).
+    DefReachesUse(f, ptr, d, ua),
+    // Suppress: write to *ptr after free-and-NULL is safe (the slot
+    // was cleared and is being re-populated, not the freed memory).
+    !SafeWriteAfterFreeAndNull(f, ptr, ua),
+    // G5: suppress if a re-init Def lies between free and use on CFG
+    // (loop reinitialization or intra-block reassignment).
+    !ReinitBetweenFreeAndUse(f, ptr, fa, ua).
 
 .output UseAfterFree
 

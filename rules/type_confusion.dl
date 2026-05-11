@@ -1,0 +1,210 @@
+// Type-confusion rules — bug classes that bin_datalog could not express
+// because binaries erase declared types. Source code preserves them, so
+// we can reason directly over (src_type, dst_type) pairs in cast
+// expressions.
+//
+// Consumes: Cast (11-arity, populated by mechanical_extractor.py).
+// Optional: Def, Use, AddressOf, Call (for cross-step laundering chains).
+//
+// All rules are conservative: they fire when the syntactic pattern is
+// present and the declared types disagree in a way that is suspicious.
+// The InterpreterAgent's drill phase resolves whether the disagreement
+// is actually a bug (e.g., first-member-aliasing structs are a benign
+// idiom that this pass will surface — drill-time confirms via source).
+
+// ════════════════════════════════════════════════════════════════════
+// TYPE DECLARATIONS
+// ════════════════════════════════════════════════════════════════════
+
+.type Sym   <: symbol
+.type Addr  <: number
+.type Ver   <: number
+.type Idx   <: number
+
+// ════════════════════════════════════════════════════════════════════
+// INPUT RELATIONS
+// ════════════════════════════════════════════════════════════════════
+
+.decl Cast(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+           src: Sym, src_ver: Ver, kind: Sym, src_width: number,
+           dst_width: number, src_type: Sym, dst_type: Sym)
+.input Cast
+
+.decl Def(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Def
+
+.decl Use(func: Sym, var: Sym, ver: Ver, addr: Addr)
+.input Use
+
+.decl AddressOf(func: Sym, var: Sym, ver: Ver, target: Sym)
+.input AddressOf
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+// ════════════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════════════
+
+// Is the type string a pointer type? (ends in "*" possibly with whitespace)
+.decl IsPointerType(t: Sym)
+IsPointerType(t) :- Cast(_, _, _, _, _, _, _, _, _, t, _),
+                    contains("*", t).
+IsPointerType(t) :- Cast(_, _, _, _, _, _, _, _, _, _, t),
+                    contains("*", t).
+
+// Is this a void pointer? (matches "void *" / "void*" / "const void *")
+.decl IsVoidPtr(t: Sym)
+IsVoidPtr(t) :- Cast(_, _, _, _, _, _, _, _, _, t, _),
+                contains("void", t),
+                contains("*", t).
+IsVoidPtr(t) :- Cast(_, _, _, _, _, _, _, _, _, _, t),
+                contains("void", t),
+                contains("*", t).
+
+// Is this a function pointer type? Heuristic: contains "(*" or matches "(...)(...)"
+.decl IsFuncPtr(t: Sym)
+IsFuncPtr(t) :- Cast(_, _, _, _, _, _, _, _, _, t, _),
+                contains("(*", t).
+IsFuncPtr(t) :- Cast(_, _, _, _, _, _, _, _, _, _, t),
+                contains("(*", t).
+
+// Strip trailing whitespace+star+const decoration to compare core types.
+// We don't have a string-trim primitive in Souffle; instead we just
+// compare canonical forms when both look like pointers and neither is
+// void*. The comparison is conservative — if the strings disagree
+// after stripping common decorations, we flag.
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 1: Incompatible struct/pointer cast
+// ════════════════════════════════════════════════════════════════════
+// A cast between two declared pointer types where the type strings
+// differ and neither side is void*. This is the classic Project Zero
+// "wrong subtype" bug. False positives expected from first-member-
+// aliasing struct idioms — drill phase confirms.
+
+.decl IncompatibleStructCast(func: Sym, addr: Addr, dst: Sym,
+                              src_type: Sym, dst_type: Sym)
+IncompatibleStructCast(f, a, dst, st, dt) :-
+    Cast(f, a, dst, _, _, _, _, _, _, st, dt),
+    IsPointerType(st),
+    IsPointerType(dt),
+    !IsVoidPtr(st),
+    !IsVoidPtr(dt),
+    !IsFuncPtr(st),
+    !IsFuncPtr(dt),
+    st != dt.
+.output IncompatibleStructCast
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 2: void* type laundering
+// ════════════════════════════════════════════════════════════════════
+// A value of declared type T was cast TO void* (Cast.dst_type = "void *"),
+// and elsewhere the SAME variable is cast FROM void* TO type U where
+// T != U. This is the canonical type-laundering pattern: the type
+// system is bypassed by the void* hop.
+//
+// Implementation: find a chain
+//   step 1: Cast(f, a1, vp, _, src, _, ..., src_type=T, dst_type="void *")
+//   step 2: Cast(f, a2, dst, _, vp, _, ..., src_type="void *", dst_type=U)
+// where T != U and both are non-void pointer types.
+
+.decl VoidPtrLaundering(func: Sym, in_addr: Addr, out_addr: Addr,
+                         src_type: Sym, dst_type: Sym)
+VoidPtrLaundering(f, a1, a2, T, U) :-
+    Cast(f, a1, vp, _, _, _, _, _, _, T, "void *"),
+    Cast(f, a2, _, _, vp, _, _, _, _, "void *", U),
+    a2 > a1,
+    IsPointerType(T),
+    IsPointerType(U),
+    !IsVoidPtr(T),
+    !IsVoidPtr(U),
+    T != U.
+.output VoidPtrLaundering
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 3: Pointer ↔ integer truncating round-trip
+// ════════════════════════════════════════════════════════════════════
+// Cast a pointer (≥ 8 bytes on 64-bit) to a smaller integer, then back.
+// On 64-bit systems this silently truncates the pointer's high bits.
+// Real Project-Zero-class bug pattern.
+
+.decl PtrIntTruncation(func: Sym, in_addr: Addr, out_addr: Addr,
+                        ptr_type: Sym, int_type: Sym, int_width: number)
+PtrIntTruncation(f, a1, a2, pT, iT, iw) :-
+    // Ptr → int (smaller than pointer width)
+    Cast(f, a1, intvar, _, _, _, _, pw, iw, pT, iT),
+    IsPointerType(pT),
+    !IsPointerType(iT),
+    pw >= 8,
+    iw < pw,
+    iw > 0,
+    // Same int variable later cast back to a pointer
+    Cast(f, a2, _, _, intvar, _, _, _, _, iT, pT2),
+    IsPointerType(pT2),
+    a2 > a1.
+.output PtrIntTruncation
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 4: Function-pointer cast mismatch
+// ════════════════════════════════════════════════════════════════════
+// Both sides of the cast are function-pointer types and the type
+// strings differ. Calling through such a pointer with a mismatched
+// signature is undefined behaviour and a frequent source of silent
+// stack-frame corruption / ROP-adjacent bugs.
+
+.decl FuncPtrCastMismatch(func: Sym, addr: Addr, dst: Sym,
+                           src_type: Sym, dst_type: Sym)
+FuncPtrCastMismatch(f, a, dst, st, dt) :-
+    Cast(f, a, dst, _, _, _, _, _, _, st, dt),
+    IsFuncPtr(st),
+    IsFuncPtr(dt),
+    st != dt.
+.output FuncPtrCastMismatch
+
+// ════════════════════════════════════════════════════════════════════
+// RULE 5: Cast-laundering against allocator return
+// ════════════════════════════════════════════════════════════════════
+// alloc() returns void*; immediately cast to T*. If the allocation
+// size argument doesn't match sizeof(T), we have undersized allocation
+// — a memory-corruption precursor. The width disagreement itself
+// surfaces here; the size check is left to existing
+// ArithToAllocSinkBridge / TaintedSizeAtSink rules.
+
+.decl AllocCastChannel(func: Sym, addr: Addr, alloc_callee: Sym,
+                        dst: Sym, dst_type: Sym)
+AllocCastChannel(f, a, callee, dst, dt) :-
+    Call(f, callee, a),
+    ( callee = "malloc"  ; callee = "calloc"  ; callee = "realloc"
+    ; callee = "xmlMalloc" ; callee = "xmlMallocAtomic"
+    ; callee = "av_malloc"  ; callee = "av_mallocz" ),
+    Cast(f, a2, dst, _, _, _, _, _, _, "void *", dt),
+    IsPointerType(dt),
+    !IsVoidPtr(dt),
+    a2 >= a,
+    a2 <= a + 5.
+.output AllocCastChannel
+
+// ════════════════════════════════════════════════════════════════════
+// COMPOUND: TaintedTypeConfusion
+// ════════════════════════════════════════════════════════════════════
+// Surface only the high-signal subset: a type-confusion finding whose
+// destination variable is also tainted. (Optional input — degrades
+// gracefully when TaintedVar.facts is empty.)
+
+.decl TaintedVar(func: Sym, var: Sym, ver: Ver, origin: Sym, ctx: Addr)
+.input TaintedVar
+
+.decl TaintedTypeConfusion(func: Sym, addr: Addr, var: Sym,
+                            kind: Sym, st: Sym, dt: Sym)
+TaintedTypeConfusion(f, a, dst, "incompat_struct_cast", st, dt) :-
+    IncompatibleStructCast(f, a, dst, st, dt),
+    TaintedVar(f, dst, _, _, _).
+TaintedTypeConfusion(f, a2, dst, "void_ptr_laundering", st, dt) :-
+    VoidPtrLaundering(f, _, a2, st, dt),
+    Cast(f, a2, dst, _, _, _, _, _, _, _, _),
+    TaintedVar(f, dst, _, _, _).
+TaintedTypeConfusion(f, a, dst, "func_ptr_mismatch", st, dt) :-
+    FuncPtrCastMismatch(f, a, dst, st, dt),
+    TaintedVar(f, dst, _, _, _).
+.output TaintedTypeConfusion

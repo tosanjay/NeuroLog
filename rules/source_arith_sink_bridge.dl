@@ -1,0 +1,124 @@
+// =============================================================
+// source_arith_sink_bridge.dl — bridging rule for the case where
+// an LLM-extracted ArithOp's result feeds into an alloc-class
+// DangerousSink without going through a Def / ResolvedVarType.
+//
+// Motivation. The LLM smell pass extracts an `ArithOp(tmp = a + b)`
+// at the call site of `malloc(a + b)` because the arithmetic is
+// inlined into the argument; at the same time, `ActualArg(call_addr,
+// 0, "size", "a + b + 2", 0)` records the argument as the literal
+// expression string rather than as a reference to `tmp`. Existing
+// rules `NarrowArithAtSink` / `OverflowAtSink` join through
+// ActualArg.var → ResolvedVarType.var → ArithOp.dst, all of which
+// rely on the destination being a named variable that survived the
+// lift. They silently miss patterns like CVE-2025-6021's
+// `xmlMalloc(lenn + lenp + 2)` in `xmlBuildQName` and its sister
+// sites in xmlregexp.c, even though every individual fact the rule
+// would need is in the fact base.
+//
+// This rule bridges the gap. It matches an ArithOp at-or-near (≤2
+// lines before) an alloc-class DangerousSink Call in the same
+// function, regardless of whether the destination has a
+// ResolvedVarType or whether ActualArg names the destination. It
+// does *not* try to be precise on the value side — that is the
+// symbex post-pass's job. Its purpose is to surface the candidate
+// set so symbex / interpreter agent see it.
+//
+// Diagnosed and prototyped via the libxml2 InterpreterAgent run
+// recorded at eval/results/libxml2_full/interpreter_session.md
+// (89 events, 19 ad-hoc Datalog queries; the agent's verdict
+// pinpointed the two-layer gap that this rule plus a
+// follow-up extraction-layer fix close).
+// =============================================================
+
+// ── Types ──────────────────────────────────────────────────────────
+.type Addr <: number
+.type Sym  <: symbol
+.type Ver  <: number
+.type Idx  <: number
+
+
+.decl ArithOp(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+              op: Sym, src: Sym, src_ver: Ver, operand: Sym)
+.input ArithOp
+
+.decl Call(caller: Sym, callee: Sym, addr: Addr)
+.input Call
+
+// 2-arity to match the catalog the runners write
+// (run_libxml2_target.py / run_ffmpeg_target.py drop the optional
+// risk column). The wider 3-arity DangerousSink relations
+// declared elsewhere in the mesh remain valid; this rule
+// deliberately reads the catalog directly.
+.decl DangerousSink(func: Sym, arg_idx: Idx)
+.input DangerousSink
+
+
+// ── Alloc-class callee whitelist ────────────────────────────────
+// We narrow to alloc-class sinks because the bug pattern
+// (size argument computed by integer arithmetic that may
+// overflow before promotion to size_t) is specific to
+// alloc-family calls. memcpy / memmove are also DangerousSink,
+// but the size argument there is typically already a length —
+// flagging arithmetic at memcpy generates more noise than
+// signal. Extend this list as new projects come online.
+
+.decl AllocCallee(name: Sym)
+AllocCallee("malloc").
+AllocCallee("calloc").
+AllocCallee("realloc").
+AllocCallee("xmlMalloc").
+AllocCallee("xmlMallocAtomic").
+AllocCallee("xmlRealloc").
+AllocCallee("xmlReallocLoc").
+AllocCallee("xmlMemMalloc").
+AllocCallee("xmlMemRealloc").
+AllocCallee("av_malloc").
+AllocCallee("av_mallocz").
+AllocCallee("av_realloc").
+AllocCallee("av_calloc").
+AllocCallee("av_fast_realloc").
+AllocCallee("av_fast_malloc").
+AllocCallee("setup_malloc").
+AllocCallee("g_malloc").
+AllocCallee("g_malloc0").
+AllocCallee("g_realloc").
+
+
+// ── Output relation: ArithToAllocSinkBridge ─────────────────────
+// One row per ArithOp / Call pairing. Multiple rows per call site
+// when more than one ArithOp is co-located (typical of nested
+// expressions like `lenn + lenp + 2` which the LLM extractor splits
+// into two adds at the same line).
+
+.decl ArithToAllocSinkBridge(func: Sym,
+                              arith_addr: Addr,
+                              sink_addr: Addr,
+                              callee: Sym,
+                              dst: Sym,
+                              op: Sym,
+                              src: Sym,
+                              operand: Sym)
+
+ArithToAllocSinkBridge(f, a_arith, a_sink, callee, dst, op, src, operand) :-
+    ArithOp(f, a_arith, dst, _, op, src, _, operand),
+    (op = "add" ; op = "mul" ; op = "sub"),
+    Call(f, callee, a_sink),
+    DangerousSink(callee, _),
+    AllocCallee(callee),
+    a_arith <= a_sink,
+    a_sink - a_arith <= 2.
+
+.output ArithToAllocSinkBridge
+
+
+// ── Per-call summary: one row per (func, sink_addr) ────────────
+// Convenience projection for triage reports — collapses multiple
+// arith ops at a single sink call site to one row.
+
+.decl ArithToAllocSinkBridgeSites(func: Sym, sink_addr: Addr, callee: Sym)
+
+ArithToAllocSinkBridgeSites(f, a_sink, callee) :-
+    ArithToAllocSinkBridge(f, _, a_sink, callee, _, _, _, _).
+
+.output ArithToAllocSinkBridgeSites

@@ -64,6 +64,17 @@
 .decl CFGReach(func: Sym, from_addr: Addr, to_addr: Addr)
 .input CFGReach
 
+// ── Inputs from source_dominance.dl ──────────────────────────────
+// Path-sensitive guard relation: EffectiveGuardDom(f, ga, ua, v) iff
+// the guard at `ga` on `v` dominates the use at `ua`. Empty when the
+// dominance pass hasn't run (e.g. legacy facts dir) — the fallback
+// reach-only branches in the rules below still fire in that case.
+.decl EffectiveGuardDom(func: Sym, guard_addr: Addr, use_addr: Addr, var: Sym)
+.input EffectiveGuardDom
+
+.decl FuncDominanceTractable(func: Sym)
+.input FuncDominanceTractable
+
 .decl DangerousSink(func: Sym, arg_idx: Idx, risk: Sym)
 // Buffer copy/set — destination and size args
 DangerousSink("memcpy",  0, "buffer_overflow").
@@ -111,6 +122,9 @@ DangerousSink("alloca",  0, "allocation_size").
 
 .decl MemWrite(func: Sym, addr: Addr, target: Sym, mem_in: Ver, mem_out: Ver)
 .input MemWrite
+
+.decl FieldRead(func: Sym, addr: Addr, base: Sym, field: Sym)
+.input FieldRead
 
 // ════════════════════════════════════════════════════════════════════
 // RULE 1: TRUNCATION — data loss when narrowing a value
@@ -313,14 +327,69 @@ TaintedSignedAtSink(f, ca, callee, v, tn, risk, origin) :-
 // ════════════════════════════════════════════════════════════════════
 
 .decl GuardedBeforeCast(func: Sym, cast_addr: Addr, src: Sym)
-// Guard must (1) check the same variable, (2) be on a CFG path reaching
-// the cast, and (3) operate on the same definition that reaches the cast.
+// Guard must (1) check the same variable, (2) effectively precede the
+// cast on the CFG (dominance when available, reach as fallback), and
+// (3) operate on the same definition that reaches the cast.
+
+// Path-sensitive variant
+GuardedBeforeCast(f, cast_a, src) :-
+    Cast(f, cast_a, _, _, src, _, _, _, _, _, _),
+    EffectiveGuardDom(f, ga, cast_a, src),
+    DefReachesUse(f, src, d, ga),
+    DefReachesUse(f, src, d, cast_a).
+// Reach-only fallback for functions past the dominance gate
 GuardedBeforeCast(f, cast_a, src) :-
     Cast(f, cast_a, _, _, src, _, _, _, _, _, _),
     Guard(f, ga, src, _, _, _, _),
     DefReachesUse(f, src, d, ga),
     DefReachesUse(f, src, d, cast_a),
-    CFGReach(f, ga, cast_a).
+    CFGReach(f, ga, cast_a),
+    !FuncDominanceTractable(f).
+
+// ── G4: cast-and-compare anti-truncation idiom ─────────────────────
+// `if ((narrow_t)x != x) return error;` — the cast at this site
+// IS the bounds check. Mechanical extractor emits ValidatingCast
+// when it detects the pattern and the THEN branch terminates.
+// Treat as a self-guard on the cast.
+.decl ValidatingCast(func: Sym, cast_addr: Addr, var: Sym)
+.input ValidatingCast
+
+GuardedBeforeCast(f, cast_a, src) :-
+    ValidatingCast(f, cast_a, src).
+
+// ── G8: spec-bound propagation through struct fields ──────────────
+// Smell pass identifies struct fields validated at parse time
+// (e.g., `if (sps->log2_min_cb_size > 6) return error;`). Consumers
+// that read those fields are bounded by the parser's validation,
+// even though no local Guard exists in the consumer function.
+//
+// FieldBoundedVar(f, v): v's value is bounded because its Def chain
+// originated from a FieldRead of a BoundedField (transitively
+// propagated through arithmetic).
+.decl BoundedField(field: Sym)
+.input BoundedField
+
+.decl FieldBoundedVar(func: Sym, var: Sym)
+.output FieldBoundedVar
+// Base: var is defined by a read of a bounded field.
+FieldBoundedVar(f, v) :-
+    Def(f, v, _, da),
+    FieldRead(f, da, _, fld),
+    BoundedField(fld).
+// Transitive: a var derived from a field-bounded var via arithmetic
+// is also field-bounded (cheap one-step propagation through the
+// `src_var` operand of ArithOp; unsound for adversarial operands but
+// adequate for the common parser-then-consumer pattern).
+FieldBoundedVar(f, v) :-
+    Def(f, v, _, da),
+    ArithOp(f, da, v, _, _, src, _, _),
+    FieldBoundedVar(f, src).
+
+// Treat field-bounded vars as guarded for cast purposes — the bound
+// is enforced upstream by the validator function.
+GuardedBeforeCast(f, cast_a, src) :-
+    Cast(f, cast_a, _, _, src, _, _, _, _, _, _),
+    FieldBoundedVar(f, src).
 
 .decl UnguardedDangerousCast(func: Sym, addr: Addr, src: Sym, dst: Sym,
                              kind: Sym, src_type: Sym, dst_type: Sym,
@@ -391,6 +460,25 @@ HasUpperBound(f, v) :- Guard(f, _, v, _, "lt", _, _).
 HasUpperBound(f, v) :- Guard(f, _, v, _, "le", _, _).
 HasUpperBound(f, v) :- Guard(f, _, v, _, "unsigned_lt", _, _).
 HasUpperBound(f, v) :- Guard(f, _, v, _, "unsigned_le", _, _).
+
+// Early-return-on-overflow patterns: `if (x >= LIMIT) return -1;`
+// (or goto-cleanup, abort, exit, longjmp). The mechanical extractor
+// emits a GuardEarlyReturn fact for the guard line when the THEN branch
+// terminates the function. We credit the guard as a real upper bound
+// only when paired with such a termination — log-only `>=` does not
+// suffice, matching the H.264 sentinel-collision bug pattern.
+.decl GuardEarlyReturn(func: Sym, guard_addr: Addr)
+.input GuardEarlyReturn
+
+HasUpperBound(f, v) :-
+    Guard(f, ga, v, _, ">=", _, _),
+    GuardEarlyReturn(f, ga).
+HasUpperBound(f, v) :-
+    Guard(f, ga, v, _, ">", _, _),
+    GuardEarlyReturn(f, ga).
+HasUpperBound(f, v) :-
+    Guard(f, ga, v, _, "==", _, _),
+    GuardEarlyReturn(f, ga).
 
 .decl UnboundedCounter(func: Sym, var: Sym, incr_addr: Addr)
 
@@ -469,14 +557,37 @@ TaintedCounterAsIndex(f, v, ia, ua, kind, origin) :-
 .decl PotentialArithOverflow(func: Sym, addr: Addr, var: Sym,
                              op: Sym, type_name: Sym, width: number)
 
-// EffectiveGuardForArith: guard on the overflow result that precedes
-// the arithmetic operation on the CFG (pre-check) or follows it (post-check).
+// EffectiveGuardForArith: guard on the overflow result that effectively
+// constrains the arithmetic operation. Three cases (any one suffices):
+//   (1) Pre-check, path-sensitive: guard at ga dominates the arith addr.
+//   (2) Pre-check, reach-fallback: guard at ga reaches the arith addr
+//       on the CFG (used when dominance unavailable for the function).
+//   (3) Post-check: guard at ga is reachable from the arith addr — the
+//       overflow result was inspected later. This is loose by design and
+//       not refined by dominance (post-dominance isn't computed).
 .decl EffectiveGuardForArith(func: Sym, arith_addr: Addr, var: Sym)
 EffectiveGuardForArith(f, a, v) :-
-    Guard(f, ga, v, _, _, _, _),
-    CFGReach(f, ga, a).
+    EffectiveGuardDom(f, _, a, v).
 EffectiveGuardForArith(f, a, v) :-
     Guard(f, ga, v, _, _, _, _),
+    CFGReach(f, ga, a),
+    !FuncDominanceTractable(f).
+EffectiveGuardForArith(f, a, v) :-
+    Guard(f, ga, v, _, _, _, _),
+    CFGReach(f, a, ga).
+
+// Validator-as-guard for arithmetic (LLM smell-pass path).
+.decl IsValidator(name: Sym)
+.input IsValidator
+EffectiveGuardForArith(f, a, v) :-
+    Call(f, callee, ga),
+    IsValidator(callee),
+    ActualArg(ga, _, _, v, _),
+    CFGReach(f, ga, a).
+EffectiveGuardForArith(f, a, v) :-
+    Call(f, callee, ga),
+    IsValidator(callee),
+    ActualArg(ga, _, _, v, _),
     CFGReach(f, a, ga).
 
 PotentialArithOverflow(f, a, dst, op, tn, w) :-

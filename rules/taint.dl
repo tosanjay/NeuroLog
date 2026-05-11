@@ -41,15 +41,13 @@
 
 // ── Configuration: Sources and Sinks ───────────────────────────────
 
-// Functions whose output is tainted (external/user-controlled input)
-.decl TaintSourceFunc(name: Sym)
-TaintSourceFunc("png_read_data").    // reads external file data
-TaintSourceFunc("read").
-TaintSourceFunc("recv").
-TaintSourceFunc("fread").
-TaintSourceFunc("fgets").
-TaintSourceFunc("getenv").
-TaintSourceFunc("scanf").
+// Functions whose output is tainted (external/user-controlled input).
+// 2-arity (name, category) — must match alias.dl / schema.dl.
+// Loaded from facts/TaintSourceFunc.facts; populated by
+// tool_generate_annotations (built-in libc set) plus any
+// project-specific entries (avio_*, png_read_data, xml*Read*, …).
+.decl TaintSourceFunc(name: Sym, category: Sym)
+.input TaintSourceFunc
 
 // Dangerous sink functions and which argument is sensitive
 // (arg_idx, risk_type)
@@ -77,13 +75,13 @@ DangerousSink("png_chunk_error", 0, "tainted_ptr").  // tainted png_ptr passed t
 // (the source function writes external data into them)
 TaintVar(caller, v, ver, cat("arg_to_", callee)) :-
     Call(caller, callee, ca),
-    TaintSourceFunc(callee),
+    TaintSourceFunc(callee, _),
     ActualArg(ca, _, _, v, ver).
 
 // Return values from taint source functions are tainted
 TaintVar(caller, v, ver, cat("ret_from_", callee)) :-
     Call(caller, callee, ca),
-    TaintSourceFunc(callee),
+    TaintSourceFunc(callee, _),
     Def(caller, v, ver, ca),
     v != "mem".  // skip mem SSA var (tracks memory state, not data)
 

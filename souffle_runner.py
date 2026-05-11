@@ -9,6 +9,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+try:
+    from audit_log import log_step as _audit_log_step  # type: ignore
+except ImportError:
+    def _audit_log_step(*args, **kwargs):  # noqa: D401
+        return None
+
 RULES_DIR = Path(__file__).parent / "rules"
 DEFAULT_FACTS_DIR = Path(__file__).parent / "facts"
 DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
@@ -120,6 +126,24 @@ def run_souffle(
     # Recycle outputs to facts/ for subsequent queries
     _recycle_outputs_to_facts(output_dir, facts_dir)
 
+    # Audit log: one line per non-empty output relation, plus a
+    # pass-summary line. The pass-summary lets a reader scan the
+    # log and see "this pass produced N relations totalling M
+    # rows"; per-relation lines let them see which rules actually
+    # fired.
+    rule_label = rule_file or "custom_rules"
+    if success:
+        nonempty = [(name, n) for name, n in stats.items() if n > 0]
+        for name, n in nonempty:
+            _audit_log_step("souffle", "souffle_output", name,
+                            f"rows={n} pass={rule_label}")
+        _audit_log_step("souffle", "souffle_pass", rule_label,
+                        f"relations={len(nonempty)} "
+                        f"total_rows={sum(n for _, n in nonempty)}")
+    else:
+        _audit_log_step("souffle", "souffle_pass", rule_label,
+                        f"status=failed stderr={(result.stderr or '')[:120]}")
+
     return {
         "success": success,
         "outputs": outputs,
@@ -153,6 +177,13 @@ def _recycle_outputs_to_facts(output_dir: Path, facts_dir: Path):
         "DoubleFree", "UnguardedDoubleFree",
         "ImplicitTruncation", "TaintedImplicitTruncation",
         "UnboundedCounter", "TaintedUnboundedCounter",
+        "CounterUsedAsIndex", "TaintedCounterAsIndex",
+        "PotentialArithOverflow", "OverflowAtSink", "TaintedOverflowAtSink",
+        # Block-level dominance outputs (from source_dominance.dl) consumed
+        # by source_memsafety.dl and source_type_safety.dl.
+        "FuncEntryBlock", "FuncDominanceTractable",
+        "BlockReach", "Dominates", "GuardDominates",
+        "EffectiveGuardDom", "WithinBlockBefore",
     ]
     copied = []
     for name in RECYCLE:
@@ -196,6 +227,52 @@ def run_taint_pipeline(
         f.unlink()
 
     interproc_file = "source_interproc.dl" if source_mode else "interproc.dl"
+
+    # G9 pre-pass: function-pointer dispatch scan. Drops two .facts files
+    # (FuncPtrAssign, IndirectCallSite) that source_interproc.dl's rule
+    # uses to synthesise Call edges through indirect dispatch tables. The
+    # scanner is idempotent; skip silently if the project's src tree
+    # isn't co-located (legacy facts-only runs).
+    if source_mode:
+        src_candidates = [
+            facts_dir.parent / "src",
+            facts_dir.parent.parent / "src",
+        ]
+        src_root = next((p for p in src_candidates if p.is_dir()), None)
+        if src_root is not None:
+            try:
+                from funcptr_scanner import scan_project, _write_facts
+                # Walk into the project-named subdir (e.g. .../src/libwebp).
+                inner = [p for p in src_root.iterdir() if p.is_dir()]
+                scan_root = inner[0] if len(inner) == 1 else src_root
+                fpa, icall = scan_project(scan_root)
+                _write_facts(fpa, facts_dir / "FuncPtrAssign.facts")
+                _write_facts(icall, facts_dir / "IndirectCallSite.facts")
+                print(f"  G9 pre-pass: {len(fpa)} FuncPtrAssign, "
+                      f"{len(icall)} IndirectCallSite rows from {scan_root}")
+            except Exception as e:
+                print(f"  G9 pre-pass: SKIPPED ({type(e).__name__}: {e})")
+        # Ensure the files exist even if no src tree was found, so
+        # source_interproc.dl's .input declarations don't bail.
+        for fname in ("FuncPtrAssign.facts", "IndirectCallSite.facts"):
+            (facts_dir / fname).touch(exist_ok=True)
+
+    # Pass 0: Block-level dominance (source mode only). Consumes
+    # BlockHead/CFGBlockEdge facts produced by tree_sitter_cfg.py and
+    # emits EffectiveGuardDom/FuncDominanceTractable for downstream
+    # passes via the recycle step. Skipped silently if block facts
+    # haven't been generated yet (legacy facts dir).
+    result0 = {"outputs": {}, "stats": {}}
+    if source_mode and (facts_dir / "BlockHead.facts").exists() \
+            and (facts_dir / "CFGBlockEdge.facts").exists():
+        print("  Pass 0: Running source_dominance.dl...")
+        result0 = run_souffle("source_dominance.dl", facts_dir=facts_dir,
+                              output_dir=output_dir, timeout=timeout, clear_output=False)
+        if not result0["success"]:
+            print(f"    [WARN] Pass 0 (dominance) failed: {result0.get('stderr', '')[:200]}")
+        _recycle_outputs_to_facts(output_dir, facts_dir)
+    elif source_mode:
+        print("  Pass 0: SKIPPED (no BlockHead/CFGBlockEdge facts — run tree_sitter_cfg.py first)")
 
     # Pass 1: Alias analysis
     print("  Pass 1: Running alias.dl...")
@@ -262,13 +339,72 @@ def run_taint_pipeline(
                 print(f"    [WARN] Pass 5 (sink_pass) failed: {result5.get('stderr', '')[:200]}")
             _recycle_outputs_to_facts(output_dir, facts_dir)
 
+    # Pass 6: ArithOp → AllocSink bridging — closes the gap where the
+    # LLM-extracted ArithOp's destination has no Def / ResolvedVarType
+    # and the ActualArg records the compound expression as a string
+    # rather than a reference to the arith dst (CVE-2025-6021 family
+    # in libxml2). See rules/source_arith_sink_bridge.dl for the
+    # design notes.
+    result6 = {"outputs": {}, "stats": {}}
+    if source_mode:
+        bridge_file = RULES_DIR / "source_arith_sink_bridge.dl"
+        if bridge_file.exists():
+            print("  Pass 6: Running source_arith_sink_bridge.dl...")
+            result6 = run_souffle("source_arith_sink_bridge.dl",
+                                  facts_dir=facts_dir,
+                                  output_dir=output_dir, timeout=timeout,
+                                  clear_output=False)
+            if not result6["success"]:
+                print(f"    [WARN] Pass 6 (arith_sink_bridge) failed: "
+                      f"{result6.get('stderr', '')[:200]}")
+            _recycle_outputs_to_facts(output_dir, facts_dir)
+
+    # Pass 7: Type-confusion family (incompatible struct cast, void*
+    # laundering, ptr-int truncation, function-pointer ABI mismatch).
+    # Source-only — bin_datalog couldn't express these because binaries
+    # erase declared types. See rules/type_confusion.dl.
+    result7 = {"outputs": {}, "stats": {}}
+    if source_mode:
+        tc_file = RULES_DIR / "type_confusion.dl"
+        if tc_file.exists():
+            print("  Pass 7: Running type_confusion.dl...")
+            result7 = run_souffle("type_confusion.dl",
+                                  facts_dir=facts_dir,
+                                  output_dir=output_dir, timeout=timeout,
+                                  clear_output=False)
+            if not result7["success"]:
+                print(f"    [WARN] Pass 7 (type_confusion) failed: "
+                      f"{result7.get('stderr', '')[:200]}")
+            _recycle_outputs_to_facts(output_dir, facts_dir)
+
+    # Pass 8: Uninitialized-variable use. Strict case (variable never
+    # defined in the function and not a formal parameter) plus
+    # tainted-uninit-arg subset. See rules/uninit_var_use.dl.
+    result8 = {"outputs": {}, "stats": {}}
+    if source_mode:
+        uv_file = RULES_DIR / "uninit_var_use.dl"
+        if uv_file.exists():
+            print("  Pass 8: Running uninit_var_use.dl...")
+            result8 = run_souffle("uninit_var_use.dl",
+                                  facts_dir=facts_dir,
+                                  output_dir=output_dir, timeout=timeout,
+                                  clear_output=False)
+            if not result8["success"]:
+                print(f"    [WARN] Pass 8 (uninit_var_use) failed: "
+                      f"{result8.get('stderr', '')[:200]}")
+            _recycle_outputs_to_facts(output_dir, facts_dir)
+
     # Merge outputs from all passes
-    all_outputs = {**result1.get("outputs", {}), **result2.get("outputs", {}),
-                   **result3.get("outputs", {}), **result4.get("outputs", {}),
-                   **result5.get("outputs", {})}
-    all_stats = {**result1.get("stats", {}), **result2.get("stats", {}),
-                 **result3.get("stats", {}), **result4.get("stats", {}),
-                 **result5.get("stats", {})}
+    all_outputs = {**result0.get("outputs", {}), **result1.get("outputs", {}),
+                   **result2.get("outputs", {}), **result3.get("outputs", {}),
+                   **result4.get("outputs", {}), **result5.get("outputs", {}),
+                   **result6.get("outputs", {}), **result7.get("outputs", {}),
+                   **result8.get("outputs", {})}
+    all_stats = {**result0.get("stats", {}), **result1.get("stats", {}),
+                 **result2.get("stats", {}), **result3.get("stats", {}),
+                 **result4.get("stats", {}), **result5.get("stats", {}),
+                 **result6.get("stats", {}), **result7.get("stats", {}),
+                 **result8.get("stats", {})}
 
     return {
         "success": result2["success"],

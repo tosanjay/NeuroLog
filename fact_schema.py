@@ -36,6 +36,8 @@ class FactKind(Enum):
     CAST = "Cast"
     VAR_TYPE = "VarType"
     VAR_WIDTH = "VarWidth"  # legacy alias — maps to VarType
+    GUARD_EARLY_RETURN = "GuardEarlyReturn"
+    VALIDATING_CAST = "ValidatingCast"
 
 
 @dataclass
@@ -131,6 +133,28 @@ RELATION_SCHEMA = {
         f.func, _g(f, "var"), _g(f, "type_name", "unknown"),
         _g(f, "width", 0), _g(f, "signedness", "unknown")
     )),
+    # Marks an `if (cond) { ... return ...; }` whose THEN branch is a
+    # function-terminating block (return, goto cleanup, abort). Lets
+    # rules credit `if (x >= LIMIT) return ERR` as a real upper bound
+    # on x — distinct from `if (x >= LIMIT) av_log(...)` which only logs.
+    "GuardEarlyReturn": ("GuardEarlyReturn.facts", lambda f: (
+        f.func, str(f.addr)
+    )),
+    # Marks a cast that *is its own validator*: `if ((narrow_t)x != x)
+    # return error;` — the cast at this addr is the bounds check on var.
+    # Suppresses UnguardedDangerousCast / TruncationCast on x at this site
+    # via the GuardedBeforeCast rule.
+    "ValidatingCast": ("ValidatingCast.facts", lambda f: (
+        f.func, str(f.addr), _g(f, "var")
+    )),
+    # `var = kTable[i]` lookup into a module-scope const table.
+    # Used by source_interproc.dl::DerivedFromBounded to flag the loaded
+    # value as "bounded by the table contents" — useful for filtering
+    # FPs where extra_y_rows = kFilterExtraRows[op_code] looks unguarded
+    # in the callee but the table only contains small literals.
+    "ConstTableLookup": ("ConstTableLookup.facts", lambda f: (
+        f.func, str(f.addr), _g(f, "var"), _g(f, "table")
+    )),
     # Legacy: LLM may still emit "VarWidth" — write to VarType.facts with defaults
     "VarWidth": ("VarType.facts", lambda f: (
         f.func, _g(f, "var"), "unknown",
@@ -146,6 +170,23 @@ ALL_FACT_FILES = sorted(set(
     "TaintSourceFunc.facts", "TaintTransfer.facts", "BufferWriteSource.facts",
     "PointsTo.facts", "StackVar.facts", "TaintKill.facts", "Guard.facts",
     "VarType.facts",
+    # LLM smell-pass relations: created empty when no smell pass ran, so
+    # Souffle .input declarations don't fail on missing files.
+    "IsValidator.facts", "IsAllocator.facts", "IsFree.facts",
+    "IsTaintSource.facts", "IsTaintSink.facts", "IsIdentity.facts",
+    "IsValidatorArg.facts", "LLMFlag.facts",
+    "GuardEarlyReturn.facts",
+    "ValidatingCast.facts",
+    "IsFreeMembers.facts",
+    "ConstTableLookup.facts",
+    # G9 function-pointer dispatch facts — emitted by funcptr_scanner.py.
+    "FuncPtrAssign.facts",
+    "IndirectCallSite.facts",
+    # G8: spec-bounded struct fields (validated at parse time, used by
+    # consumers without local guards). One-column relation: just the
+    # field name; struct discrimination is approximate but acceptable
+    # for the codecs we audit.
+    "BoundedField.facts",
 })
 
 # Column names per kind (string-keyed, same reason as RELATION_SCHEMA).
@@ -169,6 +210,7 @@ SCHEMA_DOCS = {
     "ArithOp": ["func", "addr", "dst", "dst_ver", "op", "src", "src_ver", "operand"],
     "Cast": ["func", "addr", "dst", "dst_ver", "src", "src_ver", "kind", "src_width", "dst_width", "src_type", "dst_type"],
     "VarType": ["func", "var", "type_name", "width", "signedness"],
+    "ConstTableLookup": ["func", "addr", "var", "table"],
 }
 
 
@@ -212,6 +254,12 @@ def write_facts(
             try:
                 row = extractor(f)
                 if row is not None:
+                    # Sanitise: collapse embedded newlines/tabs/CR (which would
+                    # break the TSV row format) and trim runs of whitespace.
+                    row = tuple(
+                        " ".join(str(c).replace("\t", " ").split())
+                        for c in row
+                    )
                     rows.add(row)
             except (KeyError, TypeError, ValueError) as e:
                 failed += 1

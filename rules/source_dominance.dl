@@ -1,0 +1,195 @@
+// source_dominance.dl — Block-level CFG dominance for source-level rules.
+//
+// Replaces the CFG-reachability-only "EffectiveGuard" approximation in
+// source_memsafety.dl / source_type_safety.dl with a path-sensitive
+// dominance check: a guard at block B "effectively constrains" a use at
+// block C iff every path from the function entry to C passes through B.
+//
+// The dominance is computed at basic-block granularity (block IDs are
+// leader source-line numbers) using a Souffle-friendly reach-skipping
+// characterisation:
+//
+//   Dominates(d, n) :- Reach(entry, d) ∧ Reach(entry, n) ∧ d != n
+//                    ∧ ¬ReachSkip(entry, n, d).
+//
+// where ReachSkip(s, t, skip) is reach from s to t with the `skip` block
+// removed. We restrict `skip` to blocks that contain a Guard — only those
+// are candidate dominators in our subsumption check, which keeps the
+// O(N^3) factor manageable.
+//
+// Inputs (computed by tree_sitter_cfg.py before Souffle runs):
+//   BlockHead(func, line, block_id)       — line → containing block
+//   CFGBlockEdge(func, src_block, dst_block) — block-level CFG
+//
+// Existing inputs: Guard.
+//
+// Outputs:
+//   FuncEntryBlock(func, block)
+//   BlockReach(func, src_block, dst_block)
+//   Dominates(func, dom_block, sub_block)
+//   GuardDominates(func, use_addr, guard_addr, var, op, bound, bound_type)
+//   WithinBlockBefore(func, earlier_addr, later_addr) — same block,
+//                                                       earlier source line
+//
+// Run order: any time after tree_sitter_cfg.py has populated block facts;
+// outputs are recycled to facts/ so memsafety/type_safety can consume them.
+
+// ── Types ──────────────────────────────────────────────────────────
+.type Addr <: number
+.type Sym  <: symbol
+.type Ver  <: number
+
+// ── Inputs ─────────────────────────────────────────────────────────
+.decl BlockHead(func: Sym, line: Addr, block_id: Addr)
+.input BlockHead
+
+.decl CFGBlockEdge(func: Sym, src_block: Addr, dst_block: Addr)
+.input CFGBlockEdge
+
+.decl Guard(func: Sym, addr: Addr, var: Sym, ver: Ver,
+            op: Sym, bound: Sym, bound_type: Sym)
+.input Guard
+
+// ── Function entry block ───────────────────────────────────────────
+// The smallest block_id in a function is its entry. This holds because
+// tree_sitter_cfg.py uses leader-line as block_id and the function's
+// first executable line is always its earliest leader.
+.decl FuncEntryBlock(func: Sym, block_id: Addr)
+.output FuncEntryBlock
+
+FuncEntryBlock(f, m) :-
+    BlockHead(f, _, _),
+    m = min b : { BlockHead(f, _, b) }.
+
+// ── Function size gate ─────────────────────────────────────────────
+// Dominance is O(G·N²) on block count N (G = guard-block count). The
+// gate keeps very large auto-generated parsers tractable. Functions
+// past the gate fall back to plain CFGReach in the consumer rules.
+.decl FuncBlockCount(func: Sym, n: number)
+// Distinct block count per function. Souffle's count aggregator counts
+// rows in the inner subgoal; we project to (func, block) and rely on
+// set semantics to dedup — equivalent to "distinct blocks in f".
+.decl FuncHasBlock(func: Sym, block_id: Addr)
+FuncHasBlock(f, b) :- BlockHead(f, _, b).
+
+FuncBlockCount(f, n) :-
+    FuncHasBlock(f, _),
+    n = count : { FuncHasBlock(f, _) }.
+
+#ifndef DOMINANCE_BLOCK_GATE
+#define DOMINANCE_BLOCK_GATE 1500
+#endif
+
+.decl FuncDominanceTractable(func: Sym)
+.output FuncDominanceTractable
+
+FuncDominanceTractable(f) :- FuncBlockCount(f, n), n < DOMINANCE_BLOCK_GATE.
+
+// ── BlockReach: transitive closure of CFGBlockEdge (size-gated) ────
+.decl BlockReach(func: Sym, src: Addr, dst: Addr)
+.output BlockReach
+
+BlockReach(f, s, t) :-
+    CFGBlockEdge(f, s, t),
+    FuncDominanceTractable(f).
+BlockReach(f, s, t) :-
+    BlockReach(f, s, m),
+    CFGBlockEdge(f, m, t).
+
+// ── GuardBlock: blocks that contain at least one Guard ─────────────
+// Restrict ReachSkip to these — they're the only candidate dominators
+// the consumer rules ever query.
+.decl GuardBlock(func: Sym, block_id: Addr)
+
+GuardBlock(f, b) :-
+    Guard(f, ga, _, _, _, _, _),
+    BlockHead(f, ga, b).
+
+// ── ReachSkip: block-level reach with `skip` removed ───────────────
+.decl ReachSkip(func: Sym, src: Addr, dst: Addr, skip: Addr)
+
+ReachSkip(f, s, t, k) :-
+    CFGBlockEdge(f, s, t),
+    s != k, t != k,
+    GuardBlock(f, k),
+    FuncDominanceTractable(f).
+ReachSkip(f, s, t, k) :-
+    ReachSkip(f, s, m, k),
+    CFGBlockEdge(f, m, t),
+    t != k.
+
+// ── Dominates(func, dominator, dominated) ──────────────────────────
+// d dominates n iff every path from entry to n passes through d. We
+// only emit dominance rows for guard-bearing dominators (the only
+// dominators the consumers actually need), keeping the relation small.
+.decl Dominates(func: Sym, dom_block: Addr, sub_block: Addr)
+.output Dominates
+
+Dominates(f, d, n) :-
+    FuncEntryBlock(f, e),
+    GuardBlock(f, d),
+    BlockReach(f, e, n), n != e,
+    BlockReach(f, e, d), d != n,
+    !ReachSkip(f, e, n, d).
+// Reflexive case: a guard-bearing block trivially dominates itself
+// when reachable from entry. This captures the common pattern where
+// the guard and the use sit in the same block.
+Dominates(f, b, b) :-
+    GuardBlock(f, b),
+    FuncEntryBlock(f, e),
+    ( e = b ; BlockReach(f, e, b) ).
+
+// Entry case: when the entry block contains a guard, it dominates
+// every block reachable from it. The general rule above misses this
+// because BlockReach is non-reflexive (no entry → entry edge unless
+// the entry is in a cycle), so `BlockReach(f, e, d)` with d = e fails.
+Dominates(f, e, n) :-
+    FuncEntryBlock(f, e),
+    GuardBlock(f, e),
+    BlockReach(f, e, n).
+
+// ── WithinBlockBefore: same-block source-order ordering ────────────
+// When a guard and a use are in the same block, dominance reduces to
+// "the guard's source line precedes the use's source line." This is
+// strictly precise (basic blocks are straight-line by construction).
+.decl WithinBlockBefore(func: Sym, earlier: Addr, later: Addr)
+.output WithinBlockBefore
+
+WithinBlockBefore(f, e, l) :-
+    BlockHead(f, e, b),
+    BlockHead(f, l, b),
+    e < l.
+
+// ── GuardDominates: a Guard at `ga` dominates the use at `ua` ──────
+// "Dominates" here means: either the guard's block strictly dominates
+// the use's block, OR they share a block and the guard's line precedes
+// the use's line.
+.decl GuardDominates(func: Sym, use_addr: Addr, guard_addr: Addr,
+                     var: Sym, op: Sym, bound: Sym, bound_type: Sym)
+.output GuardDominates
+
+// Cross-block case
+GuardDominates(f, ua, ga, v, op, bound, bt) :-
+    Guard(f, ga, v, _, op, bound, bt),
+    BlockHead(f, ga, gb),
+    BlockHead(f, ua, ub),
+    gb != ub,
+    Dominates(f, gb, ub).
+
+// Same-block case (precise via line ordering)
+GuardDominates(f, ua, ga, v, op, bound, bt) :-
+    Guard(f, ga, v, _, op, bound, bt),
+    BlockHead(f, ga, gb),
+    BlockHead(f, ua, gb),
+    WithinBlockBefore(f, ga, ua).
+
+// ── EffectiveGuardDom: replacement for source_*'s EffectiveGuard ───
+// Same shape as the existing reach-only relation but path-sensitive.
+// Consumers that previously queried EffectiveGuard(f, ga, ua, v) can
+// substitute this relation for a precision win.
+.decl EffectiveGuardDom(func: Sym, guard_addr: Addr, use_addr: Addr,
+                        var: Sym)
+.output EffectiveGuardDom
+
+EffectiveGuardDom(f, ga, ua, v) :-
+    GuardDominates(f, ua, ga, v, _, _, _).

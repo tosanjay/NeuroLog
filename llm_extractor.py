@@ -14,6 +14,7 @@ from pathlib import Path
 
 import litellm
 
+from agent_factory import base_completion_kwargs, resolve_api_key
 from fact_schema import Fact, FactKind, write_facts
 
 # Load the fact extraction prompt
@@ -103,12 +104,37 @@ def _estimate_max_tokens(source: str) -> int:
     return 8192
 
 
+def _build_opaque_sites_block(func_name: str, facts_dir: str | Path | None) -> str:
+    """Read OpaqueCallSite.facts (if present) and format the rows for `func_name`
+    as a small block to inject into the user message. Empty string if no rows."""
+    if facts_dir is None:
+        return ""
+    try:
+        from tree_sitter_cfg import lookup_opaque_sites_for_function
+    except ImportError:
+        return ""
+    sites = lookup_opaque_sites_for_function(facts_dir, func_name)
+    if not sites:
+        return ""
+    lines = ["", "Opaque call sites in this function (control flow may be non-local):"]
+    for line, callee, reason in sites:
+        lines.append(f"  - line {line}: {callee} ({reason})")
+    lines.append(
+        "For each: if the callee can introduce non-local control flow "
+        "(early return, goto, longjmp, unconditional terminate), emit the "
+        "corresponding CFGEdge. If it returns normally, emit nothing — the "
+        "default sequential edge already exists."
+    )
+    return "\n".join(lines)
+
+
 def extract_facts_llm(
     function_source: str,
     func_name: str,
     file_path: str = "<unknown>",
     model: str | None = None,
     api_key: str | None = None,
+    facts_dir: str | Path | None = None,
 ) -> list[Fact]:
     """Extract Datalog facts from a C/C++ function using an LLM.
 
@@ -143,10 +169,12 @@ def extract_facts_llm(
             "Extract ALL facts thoroughly — do not skip any section."
         )
 
+    opaque_block = _build_opaque_sites_block(func_name, facts_dir)
     user_msg = (
         f"Extract Datalog facts from this C function `{func_name}` "
         f"in file `{file_path}`.{size_hint}"
         f"\n\n```c\n{function_source}\n```"
+        f"{opaque_block}"
     )
 
     metrics = ExtractionMetrics(
@@ -156,16 +184,15 @@ def extract_facts_llm(
     )
 
     t0 = time.monotonic()
+    completion_kwargs = _extractor_completion_kwargs(model, max_tokens)
+    if api_key is not None:
+        completion_kwargs["api_key"] = api_key
     response = litellm.completion(
-        model=model,
-        api_key=api_key,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ],
-        temperature=0.0,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
+        **completion_kwargs,
     )
     metrics.wall_time_s = time.monotonic() - t0
 
@@ -180,16 +207,15 @@ def extract_facts_llm(
         print(f"  [WARN] 0 facts from {line_count}-line function, retrying with max_tokens={max_tokens * 2}")
         metrics.retried = True
         t0 = time.monotonic()
+        retry_kwargs = _extractor_completion_kwargs(model, min(max_tokens * 2, 64000))
+        if api_key is not None:
+            retry_kwargs["api_key"] = api_key
         response = litellm.completion(
-            model=model,
-            api_key=api_key,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0.0,
-            max_tokens=min(max_tokens * 2, 64000),
-            response_format={"type": "json_object"},
+            **retry_kwargs,
         )
         metrics.wall_time_s += time.monotonic() - t0
         _update_metrics(metrics, response, accumulate=True)
@@ -228,17 +254,29 @@ def _update_metrics(metrics: ExtractionMetrics, response, accumulate: bool = Fal
 
 
 def _resolve_api_key(model: str) -> str | None:
-    """Resolve API key from env vars based on model prefix."""
-    key = os.environ.get("API_KEY")
-    if key:
-        return key
-    if model.startswith("anthropic/"):
-        return os.environ.get("ANTHROPIC_API_KEY")
-    if model.startswith("openai/"):
-        return os.environ.get("OPENAI_API_KEY")
-    if model.startswith("gemini/") or model.startswith("google/"):
-        return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    return None
+    """Resolve API key for the given model. Delegates to
+    agent_factory.resolve_api_key, which supports API_KEY override,
+    MODEL_API_KEY_ENV indirection, and provider prefixes including
+    deepseek/."""
+    return resolve_api_key(model)
+
+
+def _extractor_completion_kwargs(model: str | None, max_tokens: int) -> dict:
+    """Build the kwargs dict for `litellm.completion` (or acompletion)
+    used by the fact extractor.
+
+    Pulls api_base / extra_body / top_p / num_retries / timeout from the
+    shared agent_factory env contract, then overrides with extractor-
+    specific knobs (temperature=0, response_format=json_object, the
+    requested max_tokens).
+    """
+    kwargs = base_completion_kwargs(model_name=model)
+    # Extractor wants deterministic structured output; override env-supplied
+    # temperature so we always get JSON-mode behaviour at temp 0.
+    kwargs["temperature"] = 0.0
+    kwargs["max_tokens"] = max_tokens
+    kwargs["response_format"] = {"type": "json_object"}
+    return kwargs
 
 
 def _has_line_numbers(source: str) -> bool:
@@ -332,6 +370,7 @@ async def extract_facts_llm_async(
     model: str | None = None,
     api_key: str | None = None,
     semaphore: "asyncio.Semaphore | None" = None,
+    facts_dir: str | Path | None = None,
 ) -> list[Fact]:
     """Async version of extract_facts_llm for parallel extraction."""
     import asyncio
@@ -354,10 +393,12 @@ async def extract_facts_llm_async(
             "Extract ALL facts thoroughly — do not skip any section."
         )
 
+    opaque_block = _build_opaque_sites_block(func_name, facts_dir)
     user_msg = (
         f"Extract Datalog facts from this C function `{func_name}` "
         f"in file `{file_path}`.{size_hint}"
         f"\n\n```c\n{function_source}\n```"
+        f"{opaque_block}"
     )
 
     metrics = ExtractionMetrics(
@@ -366,21 +407,21 @@ async def extract_facts_llm_async(
         model=model,
     )
 
+    completion_kwargs = _extractor_completion_kwargs(model, max_tokens)
+    if api_key is not None:
+        completion_kwargs["api_key"] = api_key
+
     async def _call_with_retry(max_retries=5):
         import asyncio as _aio
         for attempt in range(max_retries):
             try:
                 t0 = time.monotonic()
                 response = await litellm.acompletion(
-                    model=model,
-                    api_key=api_key,
                     messages=[
                         {"role": "system", "content": _SYSTEM_PROMPT},
                         {"role": "user", "content": user_msg},
                     ],
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"},
+                    **completion_kwargs,
                 )
                 metrics.wall_time_s += time.monotonic() - t0
                 return response
@@ -406,7 +447,11 @@ async def extract_facts_llm_async(
     if not facts and line_count > 20:
         print(f"  [WARN] 0 facts from {line_count}-line {func_name}, retrying...")
         metrics.retried = True
-        max_tokens = min(max_tokens * 2, 64000)
+        # Rebuild kwargs so the bumped max_tokens flows into the retry call.
+        completion_kwargs = _extractor_completion_kwargs(
+            model, min(max_tokens * 2, 64000))
+        if api_key is not None:
+            completion_kwargs["api_key"] = api_key
         if semaphore:
             async with semaphore:
                 response = await _call_with_retry()
@@ -426,6 +471,7 @@ def extract_facts_for_functions(
     func_sources: list[dict],
     model: str | None = None,
     api_key: str | None = None,
+    facts_dir: str | Path | None = None,
 ) -> list[Fact]:
     """Extract facts for multiple functions.
 
@@ -433,6 +479,10 @@ def extract_facts_for_functions(
         func_sources: List of dicts with keys: name, source, file_path, start_line
         model: LiteLLM model identifier.
         api_key: API key.
+        facts_dir: If provided, the extractor reads OpaqueCallSite.facts from
+                   this dir to give the LLM a per-function list of macro/asm
+                   sites to resolve (set this to whatever dir tree_sitter_cfg
+                   wrote to before extraction).
 
     Returns:
         Combined list of Fact objects for all functions.
@@ -457,6 +507,7 @@ def extract_facts_for_functions(
                 file_path=file_path,
                 model=model,
                 api_key=api_key,
+                facts_dir=facts_dir,
             )
             print(f"    → {len(facts)} facts extracted")
             all_facts.extend(facts)

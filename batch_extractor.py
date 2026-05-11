@@ -56,7 +56,31 @@ def _estimate_max_tokens(source: str) -> int:
     return 8192
 
 
-def prepare_batch_requests(func_sources: list[dict]) -> list[Request]:
+def _opaque_block_for(func_name: str, facts_dir) -> str:
+    """Format OpaqueCallSite.facts rows for one function as a context block.
+    Empty string if no rows or facts_dir not available."""
+    if facts_dir is None:
+        return ""
+    try:
+        from tree_sitter_cfg import lookup_opaque_sites_for_function
+    except ImportError:
+        return ""
+    sites = lookup_opaque_sites_for_function(facts_dir, func_name)
+    if not sites:
+        return ""
+    lines = ["", "Opaque call sites in this function (control flow may be non-local):"]
+    for line, callee, reason in sites:
+        lines.append(f"  - line {line}: {callee} ({reason})")
+    lines.append(
+        "For each: if the callee can introduce non-local control flow "
+        "(early return, goto, longjmp, unconditional terminate), emit the "
+        "corresponding CFGEdge. If it returns normally, emit nothing — the "
+        "default sequential edge already exists."
+    )
+    return "\n".join(lines)
+
+
+def prepare_batch_requests(func_sources: list[dict], facts_dir=None) -> list[Request]:
     """Convert function sources into batch request objects.
 
     Args:
@@ -85,10 +109,12 @@ def prepare_batch_requests(func_sources: list[dict]) -> list[Request]:
                 "Extract ALL facts thoroughly — do not skip any section."
             )
 
+        opaque_block = _opaque_block_for(func_name, facts_dir)
         user_msg = (
             f"Extract Datalog facts from this C function `{func_name}` "
             f"in file `{file_path}`.{size_hint}"
             f"\n\n```c\n{source}\n```"
+            f"{opaque_block}"
         )
 
         # custom_id encodes file_stem--func_name for routing results back

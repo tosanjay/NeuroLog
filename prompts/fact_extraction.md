@@ -68,9 +68,14 @@ Emit for: `obj.field = val` or `ptr->field = val`.
 Columns: `var` (string, variable whose address is taken), `ver` (int, 0), `target` (string, resulting pointer variable or "anonymous")
 Emit for: `&variable` expressions.
 
-### CFGEdge — Control flow edge
+### CFGEdge — Control flow edge (RESOLVE OPAQUE SITES ONLY)
 Columns: `to_addr` (int, target line number)
-Emit for: **ALL** control flow edges including sequential flow (line N → line N+1), branches (if → then/else), loop back-edges (end of loop body → loop header), and loop exits. CFGEdge facts are CRITICAL for reaching-definitions analysis — missing edges break taint propagation. Emit one CFGEdge for each pair of lines where execution can flow from `addr` to `to_addr`.
+**The bulk of CFGEdge facts are computed deterministically from the AST by tree-sitter before this prompt runs.** You should *only* emit CFGEdge facts to resolve flagged "opaque call sites" — control-flow macros, longjmp, inline asm — that tree-sitter cannot evaluate. The user message will list them explicitly when present.
+
+For each opaque site at `line L: callee`:
+- If the callee can introduce **non-local control flow** (early return, goto-on-error, longjmp, unconditional terminate, branch to a known cleanup label), emit the corresponding `CFGEdge` from `L` to the actual target line.
+- If the callee returns normally (e.g. an external library helper, a logger, an ordinary macro that just expands to a function call), emit **nothing** — the default sequential edge to `L+1` already exists in the tree-sitter facts.
+- Do **not** enumerate sequential, branch, or loop edges. Those are already correct from tree-sitter.
 
 ### Guard — Conditional check
 Columns: `var` (string, variable being checked), `ver` (int, 0), `op` (string: "<", "<=", ">", ">=", "==", "!="), `bound` (string, what it's compared against), `bound_type` (string: "const", "var", "sizeof")
@@ -91,6 +96,17 @@ Emit for: local variable declarations. Use type to determine size (char=1, short
 ### VarType — Variable type information (source-level)
 Columns: `var` (string), `type_name` (string, the C type as written: "int", "uint32_t", "char*", "size_t", "struct event_mgr*", "char[256]", etc.), `width` (int, size in bytes), `signedness` (string: "signed", "unsigned", "pointer", "struct", "unknown")
 Emit for: every variable (locals, parameters, globals accessed). Use the declared type from the source code. For pointers use "pointer", for struct/union types use "struct". Array types: use element count × element size as width (e.g., char[256] → width=256).
+
+### ConstTableLookup — Const-table indexing (bounded-by-construction load)
+Columns: `var` (string, the LHS variable receiving the loaded value), `table` (string, the const-table identifier)
+Emit for: assignments of the form `var = TABLE[index];` or `var = TABLE[i].field;` where `TABLE` is a module-scope `static const` array of small literal values (numeric, enum, function-pointer). The loaded value is bounded by the table contents — downstream rules use this to suppress FPs where the var appears unguarded in its scope but the table only contains small ints.
+
+Heuristic for identifying a const-table source name (emit when ANY of these holds):
+- The identifier starts with `k` followed by an uppercase letter (`kFilterExtraRows`, `kCoeffsCount`).
+- The identifier is ALL_CAPS_WITH_UNDERSCORES (`HUFFMAN_CODE_LENGTHS`, `DEFAULT_QM`).
+- The identifier ends in `_table`, `_lut`, `_lookup`, `_map` (`crc32_table`, `idct_coeffs_lut`).
+
+When unsure, prefer to emit — false positives here only weaken a guard signal, they don't introduce bugs. Example: `extra_y_rows = kFilterExtraRows[op_code];` → ConstTableLookup{var: "extra_y_rows", table: "kFilterExtraRows"}.
 
 ## Rules
 
@@ -128,13 +144,6 @@ Expected output:
   "facts": [
     {"kind": "Def", "func": "read_and_copy", "addr": 10, "fields": {"var": "filename", "ver": 0}},
     {"kind": "FormalParam", "func": "read_and_copy", "addr": 10, "fields": {"var": "filename", "idx": 0}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 10, "fields": {"to_addr": 14}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 14, "fields": {"to_addr": 15}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 15, "fields": {"to_addr": 16}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 16, "fields": {"to_addr": 17}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 17, "fields": {"to_addr": 18}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 18, "fields": {"to_addr": 19}},
-    {"kind": "CFGEdge", "func": "read_and_copy", "addr": 19, "fields": {"to_addr": 20}},
     {"kind": "StackVar", "func": "read_and_copy", "addr": 12, "fields": {"var": "buf", "offset": 0, "size": 256}},
     {"kind": "StackVar", "func": "read_and_copy", "addr": 13, "fields": {"var": "dest", "offset": 0, "size": 64}},
     {"kind": "VarType", "func": "read_and_copy", "addr": 10, "fields": {"var": "filename", "type_name": "const char*", "width": 8, "signedness": "pointer"}},
@@ -180,7 +189,7 @@ Expected output:
 
 - Be thorough: extract ALL facts from the function. Missing a Def or Use breaks data flow analysis.
 - **Def for output parameters (CRITICAL)**: When a function writes into a buffer/pointer argument, emit a `Def` for that argument at the call site. This is the most common source of missing taint propagation. Examples: `fgets(buf, n, stream)` → Def for `buf`; `read(fd, buf, n)` → Def for `buf`; `fread(ptr, size, nmemb, stream)` → Def for `ptr`; `scanf("%d %s", &x, name)` → Def for `x` and `name`; `fscanf(file, "%d", &val)` → Def for `val`; `recv(fd, buf, n, flags)` → Def for `buf`; `memcpy(dst, src, n)` → Def for `dst`; `strcpy(dst, src)` → Def for `dst`; `sprintf(dst, fmt, ...)` → Def for `dst`; `getline(&line, &len, stream)` → Def for `line`. The rule: if a callee writes data into an argument, that argument is defined (Def) at the call line.
-- **CFGEdge facts are mandatory**: emit sequential edges (N → N+1) for every consecutive pair of executable lines, plus branch/loop edges. The analysis uses reaching definitions over CFGEdge — missing edges mean taint cannot propagate between those lines.
+- **CFGEdge facts**: do NOT enumerate sequential, branch, or loop edges. Tree-sitter already produced those deterministically from the AST. Only emit CFGEdge to resolve flagged opaque sites (control-flow macros, longjmp, inline asm) — see the CFGEdge schema entry above.
 - **Def for formal parameters**: emit a Def fact for each function parameter at the function's start line. Parameters are initial definitions that must reach their uses.
 - Be precise: wrong line numbers or variable names produce incorrect analysis results.
 - Return ONLY the JSON object, no other text.
@@ -209,6 +218,29 @@ Every `if`, `while`, `for` condition that compares a variable:
 - Bounds checks: `if (len < MAX)`, `while (i < count)` → op="<", bound="MAX"
 - Overflow checks: `if (a > SIZE_MAX / b)` → size overflow guard
 - Loop conditions are Guards too: `for (i = 0; i < n; i++)` → Guard on `i` with bound `n`
+
+**Compound conditions — decompose into one Guard per clause:**
+A single `if` line may chain multiple checks with `&&`, `||`, or apply a
+top-level negation. Do not collapse these into a single Guard; emit one
+Guard fact per atomic comparison so downstream rules can match the
+bound on the right variable.
+
+- `if (!(src - data >= dist && src_end - src >= length)) return 0;`
+  → Guard{var: "src - data", op: ">=", bound: "dist", bound_type: "var"}
+  → Guard{var: "src_end - src", op: ">=", bound: "length", bound_type: "var"}
+  (The outer `!(... && ...) → return 0` is the early-return shape; the
+   downstream rules treat each clause as a bound that must hold for
+   execution to continue past line L. Emit one Guard per clause.)
+
+- `if (a > 0 && a < MAX) { ... }` → two Guards: {a, ">", "0"} and {a, "<", "MAX"}.
+- `if (a == NULL || b == NULL) return -1;` → two Guards: {a, "==", "NULL"} and {b, "==", "NULL"}.
+- `assert(len < cap && len > 0);` → two Guards: {len, "<", "cap"} and {len, ">", "0"}.
+
+Decompose conservatively: if a clause references a compound expression
+(e.g., `src - data`), use the full expression as `var` — the rule mesh
+matches on the literal string and the Datalog joins will route it to
+the right sink. Never silently drop a clause from a compound condition;
+that is the dominant FP source in caller-bound-aware analyses.
 
 ### ReturnVal — Track allocation returns
 When a function returns a value (especially from malloc/calloc/realloc), the return value must be captured so downstream analysis can track whether it's NULL-checked or used as a copy destination.

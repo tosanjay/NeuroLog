@@ -72,6 +72,44 @@
 .decl BufferWriteSource(func: Sym, arg_idx: Idx)
 .input BufferWriteSource
 
+// ArithOp — needed by G7 arithmetic-derived bound propagation
+.decl ArithOp(func: Sym, addr: Addr, dst: Sym, dst_ver: Ver,
+              op: Sym, src: Sym, src_ver: Ver, operand: Sym)
+.input ArithOp
+
+// G9 — Function-pointer dispatch.
+//
+// `FuncPtrAssign(table, idx, target, file, line)` is emitted by
+// funcptr_scanner.py (tree-sitter pass) when the project either statically
+// initialises a table of function pointers OR assigns a function name
+// into a table slot at runtime. `IndirectCallSite(caller, addr, table)`
+// is emitted when a call expression has shape `table[expr](...)`.
+//
+// Together they let us synthesise `Call(caller, target, addr)` edges
+// for indirect dispatch the LLM extractor couldn't see — without this,
+// every HE16_C / HE8uv_C / VP8 mode handler looked uncallable.
+.decl FuncPtrAssign(table: Sym, idx: Sym, target: Sym, file: Sym, line: Addr)
+.input FuncPtrAssign
+
+.decl IndirectCallSite(caller: Sym, addr: Addr, table: Sym)
+.input IndirectCallSite
+
+// Synthesise Call edges (over-approximating: any table entry is a
+// possible target at any indirect call site through that table).
+Call(caller, target, addr) :-
+    IndirectCallSite(caller, addr, table),
+    FuncPtrAssign(table, _, target, _, _).
+
+// Constant-table lookup — `var = SomeConstTable[i]` where the table is
+// a module-scope `static const` array. Values are bounded by the table's
+// contents (typically small literals), so derived var is "bounded".
+// Emitted optimistically by the LLM extractor when the LHS is read from
+// a table whose name matches the const-table naming convention (`k*`,
+// ALL_CAPS, or annotated `static const`). Optional — absent fact file
+// just means no const-table inference is contributed.
+.decl ConstTableLookup(func: Sym, addr: Addr, var: Sym, table: Sym)
+.input ConstTableLookup
+
 // Entry-point taint (user-specified attack surface)
 .decl EntryTaint(func: Sym, param_idx: Idx)
 .input EntryTaint
@@ -503,6 +541,103 @@ SanitizedVar(caller, v, v_def, callee, ca) :-
     TaintedVar(caller, v, v_def, _, _),
     DefReachesUse(caller, v, v_def, ca).
 
+// ── G7: Callee-parameter-bounds propagation ────────────────────────
+// A formal param of `callee` has an "inherited bound" if some caller
+// of `callee` provided an argument whose value was bounded at the call
+// site (explicit guard dominating the call, or a literal/constant).
+// Path-insensitive, conservative: any bounding caller counts.
+//
+// Motivating example (libwebp DecodeImageData → HE16_C):
+//   for (mb_y = 0; mb_y < mb_h; ++mb_y) {  // <-- caller's loop guard
+//     ...; HE16_C(dst);                     // dst extent inferred from mb_y
+//   }
+// The callee HE16_C has no in-function Guard; previously the rule fired
+// HE16_C@memset as TaintedSink with no GuardedSink coverage.
+// G7 surfaces the caller's `mb_y < mb_h` as an inherited bound on the
+// formal param of HE16_C that flows from `dst`.
+
+.decl InheritedParamBound(func: Sym, param: Sym, op: Sym, bound: Sym,
+                          ctx_ca: Addr, kind: Sym)
+
+// Direct: caller has explicit Guard on the var passed as actual arg,
+// dominated by the call site (CFGReach: guard-addr → call-addr).
+InheritedParamBound(callee, param, op, bound, ca, "caller_guard") :-
+    Call(caller, callee, ca),
+    ActualArg(ca, idx, _, v, _),
+    FormalParam(callee, param, idx),
+    Guard(caller, ga, v, _, op, bound, _),
+    CFGReach(caller, ga, ca).
+
+// Constant literal arg: caller passed a hard-coded value — bounded by construction.
+InheritedParamBound(callee, param, "eq", arg_expr, ca, "constant_arg") :-
+    Call(_, callee, ca),
+    ActualArg(ca, idx, _, arg_expr, _),
+    FormalParam(callee, param, idx),
+    (arg_expr = "0" ; arg_expr = "1" ; arg_expr = "2" ;
+     arg_expr = "NULL" ; arg_expr = "false" ; arg_expr = "true" ;
+     arg_expr = "-1").
+
+// Transitive: callee passes its own bounded param onward unmodified.
+// If F's param p is bounded, and F calls G(..., p, ...) without
+// redefining p, then G's matching formal param inherits the bound.
+InheritedParamBound(g, gp, op, bound, ca, "transitive") :-
+    InheritedParamBound(f, p, op, bound, _, _),
+    Call(f, g, ca),
+    ActualArg(ca, idx, _, p, _),
+    FormalParam(g, gp, idx),
+    !Def(f, p, _, ca).
+
+// G7-ext: Arithmetic-derived bound propagation.
+//
+// When the caller computes a new var from a bounded one — e.g.,
+//   end_row = start_row + num_rows  // num_rows is bounded
+// — the variable name changes and the basic `transitive` rule can't
+// follow the bound onward. Track a coarser "derived from bounded"
+// structural property that doesn't carry a precise numeric bound but
+// is enough to filter "no in-function guard" FPs at the sink layer.
+//
+// Motivating libwebp case:
+//   ProcessRows guards num_rows > 0, calls ApplyInverseTransforms(num_rows)
+//   ApplyInverseTransforms computes end_row from num_rows, calls
+//   VP8LInverseTransform(row_end = end_row).
+// Without G7-ext, VP8LInverseTransform.row_end looks unguarded.
+
+.decl DerivedFromBounded(func: Sym, var: Sym)
+
+// Direct: var IS a bounded formal param.
+DerivedFromBounded(f, p) :- InheritedParamBound(f, p, _, _, _, _).
+
+// Constant-table lookup: `var = kTable[i]` where kTable is a static
+// const array of small literals — the value loaded is bounded by the
+// table's contents and cannot grow attacker-controllably.
+DerivedFromBounded(f, v) :- ConstTableLookup(f, _, v, _).
+
+// Self-extend: arithmetic op whose src is derived-from-bounded.
+DerivedFromBounded(f, dst) :-
+    DerivedFromBounded(f, src),
+    ArithOp(f, _, dst, _, _, src, _, _),
+    dst != src.
+
+// Self-extend: any assignment whose RHS uses a derived-from-bounded var.
+// (Def at addr A + Use of derived var at same A → dst inherits derivation.)
+DerivedFromBounded(f, dst) :-
+    DerivedFromBounded(f, src),
+    Def(f, dst, _, addr),
+    Use(f, src, _, addr),
+    dst != src.
+
+// Interprocedural: caller passes a derived-from-bounded var to callee.
+// Use "derived" as op and "<unknown>" as bound — coarser than the
+// exact-arithmetic case but enough to register a sink-side filter.
+InheritedParamBound(g, gp, "derived", "<bounded>", ca, "derived_arg") :-
+    DerivedFromBounded(f, v),
+    Call(f, g, ca),
+    ActualArg(ca, idx, _, v, _),
+    FormalParam(g, gp, idx).
+
+.output InheritedParamBound
+.output DerivedFromBounded
+
 // ── Guard detection ────────────────────────────────────────────────
 // A sink is "guarded" if the tainted variable was bounds-checked.
 // Not full path sensitivity but useful for triage / false-positive reduction.
@@ -524,6 +659,19 @@ GuardedSink(caller, callee, ca, tv, op, bound) :-
     TaintedVar(caller, tv, tv_def, _, _),
     Guard(caller, guard_addr, tv, _, op, bound, _),
     DefReachesUse(caller, tv, tv_def, guard_addr).
+
+// G7-a: tainted sink arg IS the bounded formal param of caller
+GuardedSink(caller, sink_callee, ca, tv, op, bound) :-
+    TaintedSink(caller, sink_callee, ca, _, tv, _, _),
+    InheritedParamBound(caller, tv, op, bound, _, _).
+
+// G7-b: tainted sink arg was derived from a bounded formal param
+GuardedSink(caller, sink_callee, ca, p, op, bound) :-
+    TaintedSink(caller, sink_callee, ca, _, tv, _, _),
+    TaintedVar(caller, tv, tv_def, _, _),
+    Use(caller, p, _, tv_def),
+    p != tv,
+    InheritedParamBound(caller, p, op, bound, _, _).
 
 // ── Sink detection (sanitizer-aware) ───────────────────────────────
 
@@ -660,17 +808,36 @@ CommonLocal("ret"). CommonLocal("err"). CommonLocal("rc"). CommonLocal("ok").
 CommonLocal("tmp"). CommonLocal("len"). CommonLocal("buf"). CommonLocal("ptr").
 CommonLocal("result"). CommonLocal("status"). CommonLocal("count").
 CommonLocal("size"). CommonLocal("idx"). CommonLocal("val"). CommonLocal("fd").
+// Common buffer / data / loop-cursor names that frequently collide across
+// independent local scopes — without this list they get falsely promoted
+// to GlobalVar and flood TaintedGlobal across unrelated funcs.
+CommonLocal("dst"). CommonLocal("src"). CommonLocal("dest"). CommonLocal("source").
+CommonLocal("out"). CommonLocal("in"). CommonLocal("data"). CommonLocal("block").
+CommonLocal("b"). CommonLocal("a"). CommonLocal("d"). CommonLocal("e").
+CommonLocal("chunk"). CommonLocal("chunk_size"). CommonLocal("length"). CommonLocal("offset").
+CommonLocal("addr"). CommonLocal("end"). CommonLocal("start"). CommonLocal("pos").
+CommonLocal("off"). CommonLocal("code"). CommonLocal("value"). CommonLocal("key").
+CommonLocal("table"). CommonLocal("flags"). CommonLocal("ctx"). CommonLocal("hdr").
+CommonLocal("buffer"). CommonLocal("input"). CommonLocal("output"). CommonLocal("temp").
+CommonLocal("row"). CommonLocal("col"). CommonLocal("width"). CommonLocal("height").
+CommonLocal("num"). CommonLocal("max"). CommonLocal("min"). CommonLocal("bits").
+
+// IsFormalParamAnywhere: v appears as a formal param in *some* function.
+// Used as a global disqualifier — if `dst` is a formal param of HE16_C,
+// it's a local-scope name, not a true module global, even if other funcs
+// also have local Defs of `dst`.
+.decl IsFormalParamAnywhere(v: Sym)
+IsFormalParamAnywhere(v) :- FormalParam(_, v, _).
 
 .decl GlobalVar(var: Sym)
-// Require 3+ distinct functions to reduce accidental name collisions
+// Require 3+ distinct functions to reduce accidental name collisions.
+// Reject if v is a formal param anywhere (module-local, not global).
 GlobalVar(v) :-
     Def(f1, v, _, _),
     Def(f2, v, _, _),
     Def(f3, v, _, _),
     f1 != f2, f2 != f3, f1 != f3,
-    !FormalParam(f1, v, _),
-    !FormalParam(f2, v, _),
-    !FormalParam(f3, v, _),
+    !IsFormalParamAnywhere(v),
     !CommonLocal(v).
 
 GlobalVar(v) :-
@@ -678,9 +845,7 @@ GlobalVar(v) :-
     Use(f2, v, _, _),
     Use(f3, v, _, _),
     f1 != f2, f2 != f3, f1 != f3,
-    !FormalParam(f1, v, _),
-    !FormalParam(f2, v, _),
-    !FormalParam(f3, v, _),
+    !IsFormalParamAnywhere(v),
     !CommonLocal(v).
 
 // When any function taints a global variable, it becomes globally tainted.
