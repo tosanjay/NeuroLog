@@ -359,35 +359,48 @@ def find_dangerous_sinks(project_dir: str, extensions: tuple = (".c",),
 
 
 def slice_from_sinks(project_dir: str, sink_functions: list[str] | None = None,
-                      depth: int = 3, extensions: tuple = (".c",)) -> list[FuncInfo]:
-    """Backward slice from dangerous sinks up to `depth` caller levels.
+                      depth: int = 3, extensions: tuple = (".c",),
+                      forward_depth: int = 1,
+                      include_caller_buffer_ops: bool = True) -> list[FuncInfo]:
+    """Bidirectional slice from dangerous sinks.
 
-    1. Find functions containing dangerous sink calls
-    2. Trace callers backward up to `depth` levels
-    3. Return the set of all functions in the slice
+    Phase A (backward):  walk callers UP `depth` levels from sink-containing
+                          functions. Captures "code that ultimately reaches a
+                          sink".
 
-    If sink_functions is None, uses find_dangerous_sinks to discover them.
+    Phase B (forward):   walk callees DOWN `forward_depth` levels from each
+                          backward-sliced function. Captures "function that
+                          operates on a buffer set up by a sink-caller" —
+                          e.g. BuildHuffmanTable, which is called by
+                          ReadHuffmanCode (sink-caller) but has no direct
+                          sink calls of its own. Without this expansion,
+                          the slice systematically excludes buffer-operator
+                          callees, even though that is where many real
+                          OOB bugs live.
+
+    Phase C (heuristic): include any function that writes to a formal-param
+                          pointer (`param[i] = …` or `*param = …`) with no
+                          in-function bounds Guard on the index. Catches
+                          the "caller hands us a buffer, we write past it"
+                          shape directly. Off via include_caller_buffer_ops=False.
     """
     funcs_by_name = {f.name: f for f in enumerate_functions(project_dir, extensions)}
     cg = build_call_graph(project_dir, extensions)
 
-    # Reverse call graph
     reverse_cg: dict[str, set[str]] = {}
     for caller, callees in cg.items():
         for callee in callees:
             reverse_cg.setdefault(callee, set()).add(caller)
 
-    # Seed: functions containing sink calls
     if sink_functions is None:
         sinks = find_dangerous_sinks(project_dir, extensions)
         seed_funcs = {s["function"] for s in sinks}
     else:
         seed_funcs = set(sink_functions)
 
-    # BFS backward through callers
+    # ── Phase A: backward BFS through callers ───────────────────────────
     visited = set(seed_funcs)
     frontier = set(seed_funcs)
-
     for _ in range(depth):
         next_frontier = set()
         for func_name in frontier:
@@ -399,8 +412,142 @@ def slice_from_sinks(project_dir: str, sink_functions: list[str] | None = None,
         if not frontier:
             break
 
-    # Return FuncInfo for all visited functions
+    # ── Phase B: forward expansion — include callees of sliced funcs ───
+    # One hop forward by default; deeper traversal explodes the slice on
+    # codebases with high call-graph fan-out, with diminishing returns.
+    forward_added: set[str] = set()
+    frontier = set(visited)
+    for _ in range(max(0, forward_depth)):
+        next_frontier = set()
+        for func_name in frontier:
+            for callee in cg.get(func_name, set()):
+                if callee not in visited and callee in funcs_by_name:
+                    visited.add(callee)
+                    forward_added.add(callee)
+                    next_frontier.add(callee)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    # ── Phase C: caller-buffer-operation heuristic ──────────────────────
+    caller_buffer_funcs: set[str] = set()
+    if include_caller_buffer_ops:
+        caller_buffer_funcs = _find_caller_buffer_operators(funcs_by_name)
+        visited |= caller_buffer_funcs
+
+    if forward_added or caller_buffer_funcs:
+        print(f"  [slice] backward+forward+heuristic: "
+              f"backward={len(visited) - len(forward_added) - len(caller_buffer_funcs - (visited - forward_added))} "
+              f"forward+={len(forward_added)} "
+              f"caller_buffer+={len(caller_buffer_funcs - (visited - caller_buffer_funcs - forward_added))} "
+              f"total={len(visited)}")
+
     return [funcs_by_name[name] for name in visited if name in funcs_by_name]
+
+
+def _find_caller_buffer_operators(funcs_by_name: dict[str, FuncInfo]) -> set[str]:
+    """Return names of functions that write into a formal-param pointer
+    (`param[i] = …` or `*param = …`) anywhere in the function body.
+
+    This is a coarse approximation of "function operates on a buffer
+    provided by its caller". The check is purely structural — we don't
+    require a guard to be absent (the rule mesh handles that later).
+    Coarse on purpose: better to include too much here than to miss
+    BuildHuffmanTable-class bug sites.
+    """
+    parser = _create_parser()
+    out: set[str] = set()
+    seen_files: dict[str, tuple] = {}
+    for fname, info in funcs_by_name.items():
+        try:
+            cached = seen_files.get(info.file_path)
+            if cached is None:
+                cached = _parse_file(parser, info.file_path)
+                seen_files[info.file_path] = cached
+            tree, source = cached
+        except Exception:
+            continue
+        # Find the function_definition for this fname in the tree.
+        for node in _walk_function_definitions(tree.root_node):
+            if _func_name_of(node, source) != fname:
+                continue
+            params = _formal_param_names(node, source)
+            if not params:
+                break
+            if _writes_to_any_param(node, source, params):
+                out.add(fname)
+            break
+    return out
+
+
+def _func_name_of(node, source: bytes) -> str:
+    """Top-level function name from a function_definition node."""
+    d = node.child_by_field_name("declarator")
+    while d is not None:
+        if d.type == "identifier":
+            return source[d.start_byte:d.end_byte].decode("utf-8", "replace")
+        if d.type in ("function_declarator", "pointer_declarator"):
+            d = d.child_by_field_name("declarator")
+            continue
+        break
+    return ""
+
+
+def _formal_param_names(node, source: bytes) -> set[str]:
+    """Return the bare identifier names of a function_definition's
+    formal parameters."""
+    out: set[str] = set()
+    d = node.child_by_field_name("declarator")
+    # Drill to function_declarator.
+    while d is not None and d.type != "function_declarator":
+        d = d.child_by_field_name("declarator") if d.children else None
+    if d is None:
+        return out
+    plist = d.child_by_field_name("parameters")
+    if plist is None:
+        return out
+    for child in plist.children:
+        if child.type != "parameter_declaration":
+            continue
+        cur = child.child_by_field_name("declarator")
+        # Drill through pointer/array decl to the bare identifier.
+        while cur is not None:
+            if cur.type == "identifier":
+                out.add(source[cur.start_byte:cur.end_byte].decode("utf-8", "replace"))
+                break
+            cur = cur.child_by_field_name("declarator")
+    return out
+
+
+def _writes_to_any_param(node, source: bytes, params: set[str]) -> bool:
+    """Walk function body looking for `param[i] = …` or `*param = …`."""
+    body = node.child_by_field_name("body")
+    if body is None:
+        return False
+    stack = [body]
+    while stack:
+        cur = stack.pop()
+        if cur.type == "assignment_expression":
+            lhs = cur.child_by_field_name("left")
+            if lhs is not None:
+                # `param[i] = …`
+                if lhs.type == "subscript_expression":
+                    arg = lhs.child_by_field_name("argument")
+                    if arg is not None and arg.type == "identifier":
+                        name = source[arg.start_byte:arg.end_byte].decode(
+                            "utf-8", "replace")
+                        if name in params:
+                            return True
+                # `*param = …`
+                if lhs.type == "pointer_expression":
+                    for ch in lhs.children:
+                        if ch.type == "identifier":
+                            name = source[ch.start_byte:ch.end_byte].decode(
+                                "utf-8", "replace")
+                            if name in params:
+                                return True
+        stack.extend(cur.children)
+    return False
 
 
 def get_function_with_lines(file_path: str, func_name: str) -> tuple[str, int] | None:
