@@ -13,6 +13,12 @@
 
 # NeuroLog
 
+> **🚧 This repository is the ADK-based prototype and is now frozen.**
+> Active development has moved to **[neurolog-cli](https://github.com/tosanjay/neurolog-cli)**,
+> a Claude Code / OpenClaude-native rewrite (MCP server + plugin +
+> CLI, no ADK dependency). This repo remains as a runnable reference
+> implementation of the rule mesh, prompts, and analysis methodology.
+
 **Compilation-free static analysis for C/C++ using neuro-symbolic reasoning: LLM perception + Datalog logic.**
 
 NeuroLog is a neuro-symbolic static analysis research prototype that extracts and reasons about program properties from C/C++ source code — without requiring compilation. The **neural** component (an LLM) reads raw source code and extracts structured Datalog facts representing data flow, control flow, type information, and function relationships; the **symbolic** component (Souffle Datalog) performs formal interprocedural reasoning over those facts.
