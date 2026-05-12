@@ -649,38 +649,87 @@ def tool_extract_slice(
 
 
 def _extract_sequential(func_sources: list[dict], write_facts) -> tuple:
-    """Sequential LLM extraction (for small jobs or non-Anthropic models)."""
-    _extract = _import("llm_extractor").extract_facts_llm
-    results = []
-    all_facts = []
+    """LLM extraction for non-Anthropic models or sub-BATCH_THRESHOLD jobs.
 
-    for fs in func_sources:
-        entry = {"name": fs["name"], "file": fs["file_path"]}
-        source_lines = fs["source"].split('\n')
-        try:
-            if len(source_lines) > MAX_FUNCTION_LINES_EXTRACT:
-                # Chunk large functions
+    Despite the legacy name, this now runs concurrently via asyncio +
+    extract_facts_llm_async with a per-call semaphore. At sequential
+    speed a single function takes 50-300s on DeepSeek V4-Pro; 200 funcs
+    in series would be 5-16 hours, which is unworkable in an interactive
+    adk web session. Concurrency parallelises the per-function LLM calls
+    and brings 200 functions to 20-60 min wall-clock at modest server-
+    side rate-limit pressure.
+
+    Concurrency level is set via EXTRACTION_CONCURRENCY env var (default
+    10). Set to 1 to recover strictly-sequential behaviour. Functions
+    exceeding MAX_FUNCTION_LINES_EXTRACT still go through the chunked
+    sync path because the chunking helper isn't async-aware (rare —
+    only fires on functions >120 lines).
+    """
+    import asyncio
+    llm_mod = _import("llm_extractor")
+    _extract = llm_mod.extract_facts_llm
+    _extract_async = llm_mod.extract_facts_llm_async
+
+    concurrency = max(1, int(os.getenv("EXTRACTION_CONCURRENCY", "10")))
+    api_key = _resolve_api_key()
+    results: list[dict] = [None] * len(func_sources)
+    all_facts: list = []
+
+    # Split into chunked-sync (large) and async (normal) buckets so we
+    # don't make a single oversized function block the whole concurrent
+    # group.
+    async_indices: list[int] = []
+    for i, fs in enumerate(func_sources):
+        if len(fs["source"].split("\n")) > MAX_FUNCTION_LINES_EXTRACT:
+            entry = {"name": fs["name"], "file": fs["file_path"]}
+            try:
                 facts = _extract_chunked(
                     _extract, fs["source"], fs["name"], fs["file_path"])
-            else:
-                facts = _extract(
+                entry["facts"] = len(facts)
+                all_facts.extend(facts)
+            except Exception as e:
+                entry["error"] = str(e)
+            results[i] = entry
+        else:
+            async_indices.append(i)
+
+    async def _run_concurrent():
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _one(idx: int):
+            fs = func_sources[idx]
+            entry = {"name": fs["name"], "file": fs["file_path"]}
+            try:
+                facts = await _extract_async(
                     function_source=fs["source"],
                     func_name=fs["name"],
                     file_path=fs["file_path"],
                     model=MODEL_NAME,
-                    api_key=_resolve_api_key(),
+                    api_key=api_key,
+                    semaphore=sem,
                     facts_dir=FACTS_DIR,
                 )
-            entry["facts"] = len(facts)
+                entry["facts"] = len(facts)
+                return entry, facts
+            except Exception as e:
+                entry["error"] = str(e)
+                return entry, []
+
+        tasks = [_one(i) for i in async_indices]
+        return await asyncio.gather(*tasks, return_exceptions=False)
+
+    if async_indices:
+        print(f"  [extract] running {len(async_indices)} async-concurrent "
+              f"extractions (concurrency={concurrency})")
+        out = asyncio.run(_run_concurrent())
+        for idx, (entry, facts) in zip(async_indices, out):
+            results[idx] = entry
             all_facts.extend(facts)
-        except Exception as e:
-            entry["error"] = str(e)
-        results.append(entry)
 
     if all_facts:
         write_facts(all_facts, FACTS_DIR, append=True)
 
-    return all_facts, results, "sequential"
+    return all_facts, results, f"sequential(concurrency={concurrency})"
 
 
 def _extract_chunked(extract_fn, source: str, func_name: str, file_path: str) -> list:
